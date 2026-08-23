@@ -2958,7 +2958,7 @@ class Canvas(QWidget):
             f.setPointSize(max(14, int(self.height() / 26)))
             f.setBold(True)
             p.setFont(f)
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Drag your video or image here")
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Drag your videos/images here")
             p.end()
             return
 
@@ -5874,12 +5874,33 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, ev) -> bool:
         """Horizontal drag on the audio button adjusts volume (click still toggles)."""
-        # Hover anywhere: show the widget's statusTip (functional description)
-        # in the status bar; clear it on leave. Installed app-wide in __init__.
+        # Hover anywhere: show the widget's statusTip — falling back to its
+        # tooltip / nearest ancestor tooltip — in the status bar, then clear on
+        # leave. Floating tooltip windows are suppressed entirely (QEvent.ToolTip
+        # is consumed), so ALL hover info lives in the status bar only.
         et = ev.type()
+        if et == QEvent.Type.ToolTip:
+            return True  # no floating tooltips — hover info goes to the status bar
         if et == QEvent.Type.Enter and obj is not self:
             st = getattr(obj, "statusTip", None)
             tip = st() if callable(st) else ""
+            if not tip:
+                tt = getattr(obj, "toolTip", None)
+                tip = (tt() or "").strip() if callable(tt) else ""
+                if not tip:
+                    par = obj
+                    while True:
+                        nxt = getattr(par, "parentWidget", None)
+                        if not callable(nxt):
+                            break
+                        par = nxt()
+                        if par is None or par is self:
+                            break
+                        t2 = (par.toolTip() or "").strip() if hasattr(par, "toolTip") else ""
+                        if t2:
+                            tip = t2
+                            break
+            tip = " ".join((tip or "").split())
             if tip:
                 self.statusBar().showMessage(tip)
                 self._hover_status = True
