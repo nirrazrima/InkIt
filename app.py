@@ -53,7 +53,7 @@ ARCHITECTURE & COMPONENT MAP:
 
 9. MAIN APPLICATION WINDOW (MainWindow)
    - UI Construction (_build_ui):
-       * Toolbar Controls (Pen, Eraser, Color Picker, 8 History Swatches)
+       * Toolbar Controls (Pen, Eraser, Color Picker, 4 Fixed Color Circles)
        * Size Slider (1 to 80 px)
        * Pen Opacity Slider (0% to 100%)
        * Clip Opacity Slider (0% to 100%)
@@ -1870,6 +1870,24 @@ class OnionButton(QWidget):
 # ---------------------------------------------------------------------------
 # [WIDGET] VolumeButton: audio toggle whose blue fill tracks the volume level
 # ---------------------------------------------------------------------------
+class ColorSwatch(QPushButton):
+    """Fixed toolbar color slot: click applies the color, double-click assigns it."""
+
+    assigned = Signal(int)
+
+    def __init__(self, index: int, parent=None) -> None:
+        super().__init__(parent)
+        self.index = int(index)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseDoubleClickEvent(self, ev) -> None:
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.assigned.emit(self.index)
+            ev.accept()
+        else:
+            super().mouseDoubleClickEvent(ev)
+
+
 class VolumeButton(QPushButton):
     """Checked = audio on: the button fills blue from the left proportional to volume."""
 
@@ -2422,11 +2440,15 @@ def write_default_icon(path: Path) -> None:
 # 6. TIME & AUTOSAVE UTILITIES
 # ===========================================================================
 
+SWATCH_COLORS_DEFAULT = ("#ff3b30", "#ffcc00", "#34c759", "#007aff")
+
+
 def default_settings() -> dict:
     """Returns default settings dictionary."""
     return {
         "tool": "pen",
         "color": "#ff3b30",
+        "swatch_colors": list(SWATCH_COLORS_DEFAULT),
         "brush": 6,
         "hardness": 100,
         "pen_antialias": True,
@@ -3824,25 +3846,6 @@ class MainWindow(QMainWindow):
         self._dyn_styles.append(restyle)
         return box
 
-    def _tool_group(self, *widgets) -> QFrame:
-        """Wraps toolbar widgets in one bordered box with thin divider lines between them."""
-        box = QFrame()
-        box.setObjectName("toolGroup")
-        lay = QHBoxLayout(box)
-        lay.setContentsMargins(3, 3, 3, 3)
-        lay.setSpacing(4)
-        for i, wdg in enumerate(widgets):
-            if i:
-                sep = QWidget(box)
-                sep.setFixedSize(1, 20)
-                sep.setStyleSheet("background:#4a4a55;")
-                lay.addWidget(sep)
-            lay.addWidget(wdg)
-        box.setStyleSheet(
-            "#toolGroup { background:#232329; border:1px solid #3a3a42; border-radius:6px; }"
-        )
-        return box
-
     # -----------------------------------------------------------------------
     # Main UI Construction (_build_ui)
     # -----------------------------------------------------------------------
@@ -3919,12 +3922,13 @@ class MainWindow(QMainWindow):
         self.btn_picker = self._icon_button("picker", "Pick color from screen — click to assign to pen")
         self.btn_picker.clicked.connect(self._pick_screen_color)
 
-        # --- [BUTTONS] 8 Recent Color Palette Swatches ---
+        # --- [BUTTONS] 4 fixed color circles — click applies, double-click assigns ---
         self._pen_swatches = []
-        for _ in range(8):
-            sw = QPushButton()
-            sw.setFixedSize(22, 22)
-            sw.setStyleSheet("background:#444; border:1px solid #555; border-radius:11px;")
+        for i in range(4):
+            sw = ColorSwatch(i)
+            sw.setFixedSize(24, 24)
+            sw.setStyleSheet("background:#444; border:2px solid #555; border-radius:12px;")
+            sw.assigned.connect(self._assign_swatch_color)
             bar.addWidget(sw)
             self._pen_swatches.append(sw)
 
@@ -3990,33 +3994,47 @@ class MainWindow(QMainWindow):
             checkable=True, highlight=True,
         )
         self.btn_view.toggled.connect(self._nav_mode_changed)
-        bar.addWidget(self._tool_group(self.btn_view))
         self.btn_onion = OnionButton(
             value=min(max(int(self._settings.get("onion_opacity", 35)), 5), 100)
         )
         self.btn_onion.setToolTip("Onion skin — click to toggle, drag to set ghost visibility %")
         self.btn_onion.toggled.connect(self._toggle_onion)
         self.btn_onion.opacityChanged.connect(self._onion_opacity_changed)
-        self.spin_onion_prev = QSpinBox()
-        self.spin_onion_prev.setRange(0, 10)
-        self.spin_onion_prev.setMinimum(0)
-        self.spin_onion_prev.setValue(1)
-        self.spin_onion_prev.setToolTip("Ghost this many drawings BEFORE the current one")
-        self.spin_onion_prev.setFixedWidth(56)
-        self.spin_onion_prev.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.spin_onion_prev.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
+        def onion_spin(tip: str) -> QSpinBox:
+            """Compact frameless ghost-count spinner with chunky +/- steppers."""
+            sp = QSpinBox()
+            sp.setRange(0, 10)
+            sp.setValue(1)
+            sp.setToolTip(tip)
+            sp.setFixedWidth(48)
+            sp.setFixedHeight(30)
+            sp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sp.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
+            return sp
+
+        self.spin_onion_prev = onion_spin("Ghost this many drawings BEFORE the current one")
         self.spin_onion_prev.valueChanged.connect(self._onion_depth_changed)
-        self.spin_onion_next = QSpinBox()
-        self.spin_onion_next.setRange(0, 10)
-        self.spin_onion_next.setMinimum(0)
-        self.spin_onion_next.setValue(1)
-        self.spin_onion_next.setToolTip("Ghost this many drawings AFTER the current one")
-        self.spin_onion_next.setFixedWidth(56)
-        self.spin_onion_next.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.spin_onion_next.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
+        self.spin_onion_next = onion_spin("Ghost this many drawings AFTER the current one")
         self.spin_onion_next.valueChanged.connect(self._onion_depth_changed)
-        # before-count | onion | after-count in one grouped box
+
+        def restyle_spins() -> None:
+            c = self._colors()
+            ss = (
+                "QSpinBox { background: transparent; border: none;"
+                f" color: {c['text']}; font-size: 13px; padding-right: 20px; }}"
+                "QSpinBox::up-button, QSpinBox::down-button {"
+                " width: 19px; border: none; border-radius: 4px; background: transparent;}"
+                f"QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {c['card_hover']}; }}"
+                "QSpinBox::up-button:pressed, QSpinBox::down-button:pressed { background: #3d5afe; }"
+            )
+            self.spin_onion_prev.setStyleSheet(ss)
+            self.spin_onion_next.setStyleSheet(ss)
+
+        restyle_spins()
+        self._dyn_styles.append(restyle_spins)
+        # before-count | onion | after-count in one flat strip, view nav far right
         bar.addWidget(self._tool_group(self.spin_onion_prev, self.btn_onion, self.spin_onion_next))
+        bar.addWidget(self._tool_group(self.btn_view))
 
         layout.addWidget(wrap)
 
@@ -4295,8 +4313,6 @@ class MainWindow(QMainWindow):
         self.btn_color.setStyleSheet(f"background: {hexcol}; border: 1px solid #888; border-radius: 4px;")
         self._settings["color"] = hexcol
         if not self._loading_settings:
-            self._push_recent_color("pen_recent", hexcol, 8)
-            self._refresh_color_swatches()
             self._write_app_settings()
         else:
             self._schedule_save()
@@ -4351,28 +4367,37 @@ class MainWindow(QMainWindow):
         nexts = [f for f in frames if f > cur]
         self._show_frame(nexts[0] if nexts else frames[0])
 
-    def _push_recent_color(self, key: str, hexcol: str, limit: int) -> None:
-        items = [hexcol] + [c for c in self._settings.get(key, []) if str(c).lower() != hexcol.lower()]
-        self._settings[key] = items[:limit]
-
     def _refresh_color_swatches(self) -> None:
-        pens = list(self._settings.get("pen_recent") or [])
-        defaults = ["#ff3b30", "#ffcc00", "#34c759", "#007aff", "#ffffff", "#000000"]
-        for d in defaults:
-            if d.lower() not in [p.lower() for p in pens]:
-                pens.append(d)
+        """4 FIXED color slots — order never changes; double-click assigns a slot."""
+        cols = [str(c) for c in (self._settings.get("swatch_colors") or [])][:4]
+        while len(cols) < len(SWATCH_COLORS_DEFAULT):
+            cols.append(SWATCH_COLORS_DEFAULT[len(cols)])
+        self._settings["swatch_colors"] = cols
         for i, sw in enumerate(getattr(self, "_pen_swatches", [])):
-            if i >= len(pens):
-                sw.setVisible(False)
-                continue
-            sw.setVisible(True)
-            col = pens[i]
-            sw.setStyleSheet(f"background:{col}; border:1px solid #555; border-radius:11px;")
+            col = cols[i]
+            sw.setStyleSheet(
+                f"QPushButton {{ background:{col}; border:2px solid #555555;"
+                " border-radius:12px; }"
+                "QPushButton:hover { border-color:#dddddd; }"
+            )
             try:
                 sw.clicked.disconnect()
             except Exception:
                 pass
-            sw.clicked.connect(lambda _=False, c=col: self._apply_color(QColor(c)))
+            sw.clicked.connect(lambda _=False, cc=col: self._apply_color(QColor(cc)))
+
+    def _assign_swatch_color(self, idx: int) -> None:
+        """Double-click on a fixed slot: pick a color and store it in that slot."""
+        cols = [str(c) for c in (self._settings.get("swatch_colors") or [])][:4]
+        while len(cols) < len(SWATCH_COLORS_DEFAULT):
+            cols.append(SWATCH_COLORS_DEFAULT[len(cols)])
+        cur = QColor(cols[idx]) if QColor(cols[idx]).isValid() else QColor(SWATCH_COLORS_DEFAULT[idx])
+        col = QColorDialog.getColor(cur, self, f"Assign color to slot {idx + 1}")
+        if col.isValid():
+            cols[idx] = col.name(QColor.NameFormat.HexRgb)
+            self._settings["swatch_colors"] = cols
+            self._schedule_save()
+            self._refresh_color_swatches()
 
     def _pen_opacity_changed(self, v: int) -> None:
         self.canvas.pen_opacity = v / 100.0
