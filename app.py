@@ -900,60 +900,6 @@ class PressureCurveEdit(QWidget):
 # ---------------------------------------------------------------------------
 # [DIALOG] SettingsDialog: Sidebar layout with Autosave / Cursor / Pen / Shortcuts pages
 # ---------------------------------------------------------------------------
-class PenButtonsDiagram(QWidget):
-    """Wacom-style stylus diagram: nib = click, lower barrel = middle, upper = right."""
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setFixedSize(280, 234)
-
-    def paintEvent(self, _ev) -> None:
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        body_fill = QColor("#3a3a44")
-        part_fill = QColor("#55555f")
-        edge = QColor("#9a9aa5")
-        line_col = QColor("#6a6a75")
-        text_col = QColor("#eeeeee")
-
-        px = 72  # pen centerline
-        # nib (tip)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(part_fill)
-        p.drawPolygon([QPointF(px - 1, 10), QPointF(px + 7, 30), QPointF(px - 15, 48)])
-        # cone into body
-        p.drawPolygon([QPointF(px - 15, 48), QPointF(px + 7, 30), QPointF(px + 16, 56), QPointF(px - 24, 56)])
-        # body
-        p.setBrush(body_fill)
-        p.setPen(QPen(edge, 1))
-        p.drawRoundedRect(QRectF(px - 17, 54, 34, 158), 13, 13)
-        # side buttons (upper = right click, lower = middle click)
-        p.setBrush(part_fill)
-        p.setPen(Qt.PenStyle.NoPen)
-        btn_up = QRectF(px + 14, 100, 11, 22)
-        btn_lo = QRectF(px + 14, 134, 11, 22)
-        p.drawRoundedRect(btn_up, 3, 3)
-        p.drawRoundedRect(btn_lo, 3, 3)
-
-        f = self.font()
-        f.setPointSize(9)
-        f.setBold(True)
-        p.setFont(f)
-        p.setPen(QPen(line_col, 1.4))
-
-        def callout(y: float, text: str, anchor_x: float, anchor_y: float) -> None:
-            p.drawLine(QPointF(anchor_x, anchor_y), QPointF(128, y))
-            p.setPen(QPen(text_col, 1))
-            p.drawText(QRectF(136, y - 11, 140, 22),
-                       int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), text)
-            p.setPen(QPen(line_col, 1.4))
-
-        callout(28, "Click", px + 2, 26)          # nib
-        callout(111, "Right Click", btn_up.right(), btn_up.center().y())
-        callout(145, "Middle Click", btn_lo.right(), btn_lo.center().y())
-
-
 class SettingsDialog(QDialog):
     """Settings window with a left navigation sidebar and stacked pages."""
 
@@ -1117,23 +1063,6 @@ class SettingsDialog(QDialog):
         self.aa_check.setChecked(bool(cursor.get("antialias", True)))
         pv.addWidget(self.aa_check)
         pv.addWidget(QLabel("Soft ↔ hard brush: use the Hardness slider in the toolbar."))
-
-        pv.addSpacing(10)
-        title = QLabel("Stylus buttons")
-        title.setStyleSheet("font-weight: 600;")
-        pv.addWidget(title)
-        self.pen_diagram = PenButtonsDiagram(self)
-        self.pen_diagram.setToolTip(
-            "Standard stylus mapping (matches Wacom defaults):\n"
-            "nib = click, lower side button = middle click, upper side button = right click"
-        )
-        pv.addWidget(self.pen_diagram)
-        map_hint = QLabel(
-            "Standard driver mapping — matches the Wacom defaults. "
-            "Change button functions in your tablet driver if needed."
-        )
-        map_hint.setWordWrap(True)
-        pv.addWidget(map_hint)
 
         pv.addSpacing(10)
         title = QLabel("Pressure curve — pen pressure → stroke width")
@@ -2047,13 +1976,13 @@ class ValueBox(QWidget):
         self.plus_btn = QPushButton("+")
         self.display = QLabel(str(self._value))
         self.display.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.display.setFixedWidth(18)
+        self.display.setFixedWidth(22)
         self.display.setStyleSheet(
             "color:white; font-size:12px; font-weight:bold; background:transparent;"
         )
 
         for b in (self.minus_btn, self.plus_btn):
-            b.setFixedSize(17, 28)
+            b.setFixedSize(19, 28)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setStyleSheet(
                 "QPushButton { background-color:transparent; color:#ccc; border:none;"
@@ -2065,7 +1994,7 @@ class ValueBox(QWidget):
         lay.addWidget(self.minus_btn)
         lay.addWidget(self.display)
         lay.addWidget(self.plus_btn)
-        self.setFixedSize(52, 30)
+        self.setFixedSize(60, 30)
 
         self.minus_btn.clicked.connect(self.decrement)
         self.plus_btn.clicked.connect(self.increment)
@@ -3102,8 +3031,8 @@ class Canvas(QWidget):
         """
         proj = self.project
         f0 = int(self.current_frame)
-        dp = min(max(int(getattr(self, "onion_depth_prev", 1)), 0), 5)
-        dn = min(max(int(getattr(self, "onion_depth_next", 1)), 0), 5)
+        dp = min(max(int(getattr(self, "onion_depth_prev", 1)), 0), 10)
+        dn = min(max(int(getattr(self, "onion_depth_next", 1)), 0), 10)
         picks: list[tuple[int, QColor, int]] = []
         if dp > 0:
             before = [f for f in proj.annotated_frames() if f < f0][-dp:]
@@ -4206,10 +4135,10 @@ class MainWindow(QMainWindow):
         self.btn_onion.setToolTip("Onion skin — click to toggle, drag to set ghost visibility %")
         self.btn_onion.toggled.connect(self._toggle_onion)
         self.btn_onion.opacityChanged.connect(self._onion_opacity_changed)
-        self.spin_onion_prev = ValueBox(initial=1, minimum=0, maximum=5)
+        self.spin_onion_prev = ValueBox(initial=1, minimum=0, maximum=10)
         self.spin_onion_prev.setToolTip("Ghost this many drawings BEFORE the current one")
         self.spin_onion_prev.valueChanged.connect(self._onion_depth_changed)
-        self.spin_onion_next = ValueBox(initial=1, minimum=0, maximum=5)
+        self.spin_onion_next = ValueBox(initial=1, minimum=0, maximum=10)
         self.spin_onion_next.setToolTip("Ghost this many drawings AFTER the current one")
         self.spin_onion_next.valueChanged.connect(self._onion_depth_changed)
 
@@ -5786,8 +5715,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_onion"):
             self.btn_onion.setOn(bool(s.get("onion", False)))
         if hasattr(self, "spin_onion_prev"):
-            self.spin_onion_prev.setValue(min(max(int(s.get("onion_depth_prev", 1)), 0), 5))
-            self.spin_onion_next.setValue(min(max(int(s.get("onion_depth_next", 1)), 0), 5))
+            self.spin_onion_prev.setValue(min(max(int(s.get("onion_depth_prev", 1)), 0), 10))
+            self.spin_onion_next.setValue(min(max(int(s.get("onion_depth_next", 1)), 0), 10))
             self.canvas.onion_depth_prev = self.spin_onion_prev.value()
             self.canvas.onion_depth_next = self.spin_onion_next.value()
         if hasattr(self, "btn_onion"):
