@@ -1632,14 +1632,14 @@ class ToolButton(QWidget):
             base, fill = QColor("#ff9f43"), QColor("#c97a1e")
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(base)
-        p.drawRoundedRect(r, 4, 4)
+        p.drawRect(r)
         span = max(1, self.maximum - self.minimum)
         fw = ((self._value - self.minimum) / span) * (self.width() - 2)
         if fw > 0.5:
             p.save()
             p.setClipRect(QRectF(1, 1, fw, self.height() - 2))
             p.setBrush(fill)
-            p.drawRoundedRect(r, 4, 4)
+            p.drawRect(r)
             p.restore()
         f = self.font()
         f.setBold(True)
@@ -1907,7 +1907,7 @@ class GlyphSpin(QSpinBox):
         p.setPen(pen)
         cx = w - bw // 2
         cy_up, cy_dn = bh / 2, h - bh / 2
-        L = 2.25
+        L = 3.375
         p.drawLine(QPointF(cx - L, cy_up), QPointF(cx + L, cy_up))
         p.drawLine(QPointF(cx, cy_up - L), QPointF(cx, cy_up + L))
         p.drawLine(QPointF(cx - L, cy_dn), QPointF(cx + L, cy_dn))
@@ -4043,20 +4043,24 @@ class MainWindow(QMainWindow):
 
         def restyle_spins() -> None:
             c = self._colors()
-            ss = (
-                "QSpinBox { background: transparent;"
-                f" border: 1px solid {c['border']}; border-radius: 6px;"
-                f" color: {c['text']}; font-size: 13px;"
-                " padding: 0 11px 0 2px; }"
-                "QSpinBox QLineEdit { background: transparent;"
-                f" color: {c['text']}; border: none; }}"
-                "QSpinBox::up-button, QSpinBox::down-button {"
-                f" width: 9px; background: transparent;"
-                f" border-left: 1px solid {c['border']};}}"
-                f"QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {c['card_hover']}; }}"
-            )
-            self.spin_onion_prev.setStyleSheet(ss)
-            self.spin_onion_next.setStyleSheet(ss)
+
+            def spin_ss(radius: str) -> str:
+                return (
+                    "QSpinBox { background: transparent;"
+                    f" border: 1px solid {c['border']}; border-radius: {radius};"
+                    f" color: {c['text']}; font-size: 13px;"
+                    " padding: 0 11px 0 2px; }"
+                    "QSpinBox QLineEdit { background: transparent;"
+                    f" color: {c['text']}; border: none; }}"
+                    "QSpinBox::up-button, QSpinBox::down-button {"
+                    f" width: 9px; background: transparent;"
+                    f" border-left: 1px solid {c['border']};}}"
+                    f"QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {c['card_hover']}; }}"
+                )
+
+            # inner edges square so [prev][onion][next] reads as one block
+            self.spin_onion_prev.setStyleSheet(spin_ss("6px 0 0 6px"))
+            self.spin_onion_next.setStyleSheet(spin_ss("0 6px 6px 0"))
 
         restyle_spins()
         self._dyn_styles.append(restyle_spins)
