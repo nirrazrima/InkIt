@@ -903,7 +903,7 @@ class PressureCurveEdit(QWidget):
 class SettingsDialog(QDialog):
     """Settings window with a left navigation sidebar and stacked pages."""
 
-    def __init__(self, current: Path, default: Path, cursor: dict | None = None, shortcuts: dict | None = None, parent=None, autodelete: bool = True, max_days: int = 90) -> None:
+    def __init__(self, current: Path, default: Path, cursor: dict | None = None, shortcuts: dict | None = None, parent=None, autodelete: bool = True, max_days: int = 90, onion_opacity: int = 35) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.resize(660, 540)
@@ -927,7 +927,7 @@ class SettingsDialog(QDialog):
             "QListWidget#settingsNav::item:selected { background: #2a3ec4; color: #ffffff;"
             " border-radius: 3px; }"
         )
-        for title in ("Autosave", "Cursor", "Pen", "Shortcuts"):
+        for title in ("Autosave", "Cursor", "Pen", "Onion Skinning", "Shortcuts"):
             self._nav.addItem(title)
         body.addWidget(self._nav)
 
@@ -937,6 +937,7 @@ class SettingsDialog(QDialog):
         self._stack.addWidget(self._build_autosave_page(current, autodelete, max_days))
         self._stack.addWidget(self._build_cursor_page(cursor))
         self._stack.addWidget(self._build_pen_page(cursor))
+        self._stack.addWidget(self._build_onion_page(cursor, onion_opacity))
         self._stack.addWidget(self._build_shortcuts_page(shortcuts or {}))
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -1086,10 +1087,38 @@ class SettingsDialog(QDialog):
         reset_row.addStretch(1)
         pv.addLayout(reset_row)
 
-        pv.addSpacing(10)
-        onion_lbl = QLabel("Onion skin ghost colors")
+        pv.addStretch(1)
+        return page
+
+    def _build_onion_page(self, cursor: dict, onion_opacity: int = 35) -> QWidget:
+        """Dedicated Onion Skinning settings section."""
+        page, ov = self._page()
+        title = QLabel("Ghost visibility")
+        title.setStyleSheet("font-weight: 600;")
+        ov.addWidget(title)
+        srow = QHBoxLayout()
+        self.onion_vis_slider = QSlider(Qt.Orientation.Horizontal)
+        self.onion_vis_slider.setRange(5, 100)
+        self.onion_vis_slider.setValue(int(min(max(int(onion_opacity), 5), 100)))
+        self.onion_vis_label = QLabel(f"{self.onion_vis_slider.value()}%")
+        self.onion_vis_label.setFixedWidth(38)
+        self.onion_vis_slider.valueChanged.connect(
+            lambda v: self.onion_vis_label.setText(f"{v}%")
+        )
+        srow.addWidget(self.onion_vis_slider, 1)
+        srow.addWidget(self.onion_vis_label)
+        ov.addLayout(srow)
+        hint = QLabel(
+            "Overall brightness of ghosted drawings. The drawing nearest the "
+            "current one is the brightest; older ones fade with distance."
+        )
+        hint.setWordWrap(True)
+        ov.addWidget(hint)
+
+        ov.addSpacing(10)
+        onion_lbl = QLabel("Ghost colors")
         onion_lbl.setStyleSheet("font-weight: 600;")
-        pv.addWidget(onion_lbl)
+        ov.addWidget(onion_lbl)
         orow = QHBoxLayout()
         self.btn_onion_prev = QPushButton()
         self.btn_onion_prev.setFixedSize(34, 24)
@@ -1105,14 +1134,17 @@ class SettingsDialog(QDialog):
         orow.addWidget(QLabel("Next"))
         orow.addWidget(self.btn_onion_next)
         orow.addStretch(1)
-        pv.addLayout(orow)
+        ov.addLayout(orow)
         self._sync_onion_swatches(cursor.get("onion_prev", "#c248ff"), cursor.get("onion_next", "#33ccff"))
 
-        onion_hint = QLabel("Toggle ghosts with the onion button on the toolbar.")
-        onion_hint.setWordWrap(True)
-        pv.addWidget(onion_hint)
-        pv.addStretch(1)
+        tip = QLabel("Toggle ghosts with the onion button on the toolbar.")
+        tip.setWordWrap(True)
+        ov.addWidget(tip)
+        ov.addStretch(1)
         return page
+
+    def onion_visibility(self) -> int:
+        return int(self.onion_vis_slider.value())
 
     def _sync_onion_swatches(self, prev_hex: str, next_hex: str) -> None:
         self._onion_prev_hex = prev_hex
@@ -1850,6 +1882,10 @@ class OnionButton(QWidget):
 
     def mouseMoveEvent(self, ev) -> None:
         if self._press_pos is not None:
+            if not self.on:
+                # onion off: click still toggles on release, but sliding does nothing
+                ev.accept()
+                return
             d = ev.position() - self._press_pos
             if not self._moved and (abs(d.x()) > 4 or abs(d.y()) > 4):
                 self._moved = True
@@ -1878,6 +1914,9 @@ class OnionButton(QWidget):
         super().mouseReleaseEvent(ev)
 
     def wheelEvent(self, ev) -> None:
+        if not self.on:
+            ev.accept()
+            return
         d = ev.angleDelta().y()
         if d:
             self.setValue(self._value + (1 if d > 0 else -1))
@@ -1947,7 +1986,7 @@ class ValueBox(QWidget):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setStyleSheet(
                 "QPushButton { background-color:transparent; color:#ccc; border:none;"
-                " font-size:11px; }"
+                " padding:0; font-size:11px; }"
                 "QPushButton:hover { background-color:#3c3c3c; }"
                 "QPushButton:pressed { background-color:#5285a6; color:white; }"
             )
@@ -2997,7 +3036,8 @@ class Canvas(QWidget):
         picks: list[tuple[int, QColor, int]] = []
         if dp > 0:
             before = [f for f in proj.annotated_frames() if f < f0][-dp:]
-            for i, f in enumerate(before):
+            for i, f in enumerate(reversed(before)):
+                # rank 1 = the ghost NEAREST the current drawing (brightest)
                 picks.append((f, self.onion_prev, i + 1))
         if dn > 0:
             after = [f for f in proj.annotated_frames() if f > f0][:dn]
@@ -4633,6 +4673,7 @@ class MainWindow(QMainWindow):
             self.get_autosave_dir(), default_autosave_dir(), cur, dict(self._shortcuts), self,
             autodelete=bool(self._settings.get("autosave_autodelete", True)),
             max_days=int(self._settings.get("autosave_max_days", 90)),
+            onion_opacity=int(self._settings.get("onion_opacity", 35)),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             if dlg.deleted:
@@ -4658,6 +4699,8 @@ class MainWindow(QMainWindow):
         self.canvas.pressure_curve = curve
         self.canvas.onion_prev = QColor(oprev)
         self.canvas.onion_next = QColor(onext)
+        self.btn_onion.setValue(dlg.onion_visibility())  # syncs canvas + settings
+        self._schedule_save()
         self.canvas.update()
         self._settings.update({
             "cursor_mode": cs["mode"],
