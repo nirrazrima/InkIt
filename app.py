@@ -2124,6 +2124,15 @@ class ScreenColorPicker(QWidget):
         return self._gdi_pixel(gp.x(), gp.y())
 
     # -- behavior -----------------------------------------------------------
+    def pick_global(self, gp=None) -> None:
+        """Sample the pixel at global pos (cursor by default) and finish."""
+        self._picked = True
+        self.picked.emit(self._sample(gp or QCursor.pos()) or self._color)
+        self.close()
+
+    def cancel(self) -> None:
+        self.close()
+
     def _follow(self) -> None:
         pos = QCursor.pos()
         c = self._sample(pos)
@@ -2153,11 +2162,9 @@ class ScreenColorPicker(QWidget):
 
     def mousePressEvent(self, ev) -> None:
         if ev.button() == Qt.MouseButton.LeftButton:
-            self._picked = True
-            self.picked.emit(self._sample(QCursor.pos()) or self._color)
-            self.close()
+            self.pick_global()
         elif ev.button() == Qt.MouseButton.RightButton:
-            self.close()
+            self.cancel()
 
     # -- painting -----------------------------------------------------------
     def paintEvent(self, _ev) -> None:
@@ -4451,10 +4458,15 @@ class MainWindow(QMainWindow):
             return
         self._screen_picker = picker  # keep a reference while it is open
         picker.picked.connect(self._apply_color)
-        picker.destroyed.connect(self.activateWindow)
+        picker.destroyed.connect(self._end_screen_pick)
         picker.show()
         picker.activateWindow()
         picker.raise_()
+
+    def _end_screen_pick(self, *_):
+        """Picker closed: drop the reference and give focus back to InkIt."""
+        self._screen_picker = None
+        self.activateWindow()
 
     def _hardness_changed(self, v: int) -> None:
         self.canvas.hardness = min(max(int(v), 0), 100) / 100.0
@@ -5883,6 +5895,27 @@ class MainWindow(QMainWindow):
         et = ev.type()
         if et == QEvent.Type.ToolTip:
             return True  # no floating tooltips — hover info goes to the status bar
+        # Eyedropper owns ALL mouse input while open: clicks sample the color
+        # under the cursor and are never delivered to buttons underneath.
+        pk = getattr(self, "_screen_picker", None)
+        if pk is not None and et in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.MouseMove,
+            QEvent.Type.Wheel,
+            QEvent.Type.TabletPress,
+            QEvent.Type.TabletRelease,
+            QEvent.Type.KeyPress,
+        ):
+            if et == QEvent.Type.KeyPress and ev.key() == Qt.Key.Key_Escape:
+                pk.cancel()
+            elif et == QEvent.Type.MouseButtonPress:
+                if ev.button() == Qt.MouseButton.LeftButton:
+                    pk.pick_global()
+                elif ev.button() == Qt.MouseButton.RightButton:
+                    pk.cancel()
+            return True  # swallow — nothing else reacts while picking
         if et == QEvent.Type.Enter and obj is not self:
             vis = getattr(obj, "isVisible", None)
             if callable(vis) and not vis():
