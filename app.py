@@ -1891,7 +1891,7 @@ class ColorSwatch(QPushButton):
 class GlyphSpin(QSpinBox):
     """Spinbox that always paints its own chunky +/− stepper glyphs."""
 
-    BTN_W = 24
+    BTN_W = 9
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1903,11 +1903,11 @@ class GlyphSpin(QSpinBox):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         w, h = self.width(), self.height()
         bw, bh = self.BTN_W, h // 2
-        pen = QPen(QColor("#e6e6e6"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        pen = QPen(QColor("#e6e6e6"), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
         p.setPen(pen)
         cx = w - bw // 2
         cy_up, cy_dn = bh / 2, h - bh / 2
-        L = 4.5
+        L = 2.25
         p.drawLine(QPointF(cx - L, cy_up), QPointF(cx + L, cy_up))
         p.drawLine(QPointF(cx, cy_up - L), QPointF(cx, cy_up + L))
         p.drawLine(QPointF(cx - L, cy_dn), QPointF(cx + L, cy_dn))
@@ -4047,9 +4047,11 @@ class MainWindow(QMainWindow):
                 "QSpinBox { background: transparent;"
                 f" border: 1px solid {c['border']}; border-radius: 6px;"
                 f" color: {c['text']}; font-size: 13px;"
-                " padding: 0 26px 0 2px; }"
+                " padding: 0 11px 0 2px; }"
+                "QSpinBox QLineEdit { background: transparent;"
+                f" color: {c['text']}; border: none; }}"
                 "QSpinBox::up-button, QSpinBox::down-button {"
-                f" width: 24px; background: transparent;"
+                f" width: 9px; background: transparent;"
                 f" border-left: 1px solid {c['border']};}}"
                 f"QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {c['card_hover']}; }}"
             )
