@@ -550,7 +550,7 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "undo": "Undo the last stroke on this frame",
     "redo": "Re-apply the last undone stroke",
     "clear_frame": "Erase all drawings on this frame",
-    "pen": "Toggle between pen and eraser",
+    "pen": "Toggle between pen and eraser — [ and ] resize the brush",
     "eraser": "Select the eraser tool",
     "brush_smaller": "Decrease brush size",
     "brush_larger": "Increase brush size",
@@ -575,6 +575,7 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
 
 # Toolbar/playback buttons linked to their action keys (tooltip + status bar).
 BUTTON_ACTION_KEYS: dict[str, str] = {
+    "btn_tool": "pen",
     "btn_view": "zoom_mode",
     "btn_onion": "onion",
     "btn_picker": "pick_color",
@@ -4298,7 +4299,8 @@ class MainWindow(QMainWindow):
             sc = self._shortcuts.get(key, DEFAULT_SHORTCUTS.get(key, ""))
             base = wdg.toolTip().split("\n[")[0]
             wdg.setToolTip(f"{base}\n[{sc}]" if sc else base)
-            wdg.setStatusTip(ACTION_DESCRIPTIONS.get(key) or ACTION_LABELS.get(key, key))
+            desc = ACTION_DESCRIPTIONS.get(key) or ACTION_LABELS.get(key, key)
+            wdg.setStatusTip(f"{desc} [{sc}]" if sc else desc)
 
     def _build_menus(self) -> None:
         m = self.menuBar()
@@ -5882,6 +5884,9 @@ class MainWindow(QMainWindow):
         if et == QEvent.Type.ToolTip:
             return True  # no floating tooltips — hover info goes to the status bar
         if et == QEvent.Type.Enter and obj is not self:
+            vis = getattr(obj, "isVisible", None)
+            if callable(vis) and not vis():
+                return super().eventFilter(obj, ev)  # off-screen: no hover info
             st = getattr(obj, "statusTip", None)
             tip = st() if callable(st) else ""
             if not tip:
