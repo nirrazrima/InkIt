@@ -2750,8 +2750,8 @@ class Canvas(QWidget):
         self._cache_key = None
         self._n_committed = 0                   # Strokes baked into _committed
         self._rendered = 0                      # Points of active stroke already painted
-        self._onion_cache: list | None = None   # Cached ghost images [(QImage, rank), ...]
-        self._onion_cache_key = None
+        self._ghost_cache: dict = {}            # LRU {frame: (QImage, sig)} for onion ghosts
+        self._ghost_gkey = None                 # invalidation key for _ghost_cache
 
     def set_nav_mode(self, on: bool) -> None:
         """Activates the toolbar View nav gestures (False disables)."""
@@ -3054,11 +3054,12 @@ class Canvas(QWidget):
         return picks
 
     def _draw_onion(self, p: QPainter) -> None:
-        """Renders previous/next *drawings* as tinted ghosts, cached until inputs change.
+        """Renders previous/next *drawings* as tinted ghosts, cached per frame.
 
-        Ghosts are pre-rendered once in DOCUMENT pixels and only re-composited
-        (scaled into the current view rect) while zooming/panning, so navigation
-        stays smooth even with several ghosted drawings.
+        Every ghosted drawing is pre-rendered once in DOCUMENT pixels into an
+        LRU cache keyed by its frame. During playback only frames whose
+        neighbours actually changed cost a rebuild — the rest are reused — so
+        onion skinning no longer drags the frame rate down.
         """
         picks = self._onion_picks()
         if not picks:
@@ -3069,23 +3070,40 @@ class Canvas(QWidget):
         scale0 = min(wr.width() / max(pw, 1), wr.height() / max(ph, 1))
         base_w = max(1.0, float(pw) * scale0)
         wscale = float(pw) / base_w  # doc px per screen px at unzoomed fit
-        sz = self.size()
-        key = (
-            id(self.project), int(self.current_frame), pw, ph,
-            sz.width(), sz.height(),
+        gkey = (
+            id(self.project), pw, ph,
             round(wscale, 4),
             int(getattr(self, "onion_depth_prev", 1)), int(getattr(self, "onion_depth_next", 1)),
             self.onion_prev.name(QColor.NameFormat.HexRgb), self.onion_next.name(QColor.NameFormat.HexRgb),
             bool(getattr(self, "antialias", True)),
-        ) + tuple(
-            (f, len(self.project.strokes.get(f, [])), sum(len(s.points) for s in self.project.strokes.get(f, [])))
-            for f, _c, _r in picks
         )
-        if self._onion_cache is None or self._onion_cache_key != key:
-            self._onion_cache = self._build_onion_ghosts(picks, pw, ph, wscale)
-            self._onion_cache_key = key
+        cache = getattr(self, "_ghost_cache", None)
+        if cache is None or getattr(self, "_ghost_gkey", None) != gkey:
+            cache = {}
+            self._ghost_cache = cache
+            self._ghost_gkey = gkey
+        out = []
+        for f, col, rank in picks:
+            strokes = self.project.strokes.get(f, [])
+            sig = (
+                col.name(QColor.NameFormat.HexRgb),
+                len([s for s in strokes if s.points and not s.eraser]),
+                sum(len(s.points) for s in strokes),
+            )
+            ent = cache.pop(f, None)
+            if ent is not None and ent[1] == sig:
+                cache[f] = ent  # LRU touch
+                out.append((ent[0], rank))
+                continue
+            built = self._build_onion_ghosts([(f, col, rank)], pw, ph, wscale)
+            if not built:
+                continue
+            cache[f] = (built[0][0], sig)
+            if len(cache) > 16:
+                cache.pop(next(iter(cache)))
+            out.append((built[0][0], rank))
         base_op = min(max(getattr(self, "onion_opacity", 0.35), 0.05), 1.0)
-        for (ghost, rank) in self._onion_cache:
+        for (ghost, rank) in out:
             p.setOpacity(base_op * (0.65 ** (rank - 1)))
             p.drawImage(self._dst, ghost)
         p.setOpacity(1.0)
@@ -3797,9 +3815,15 @@ class ExportWorker(QThread):
 # ===========================================================================
 
 class QueueList(QListWidget):
-    """Shot list with Delete-key support (overrides the global clear-frame shortcut)."""
+    """Shot list: Delete removes entries, internal drag & drop reorders them."""
 
     deleteRequested = Signal()
+    rowsMoved = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
 
     def event(self, ev) -> bool:
         if ev.type() == QEvent.Type.ShortcutOverride and ev.key() == Qt.Key.Key_Delete:
@@ -3813,6 +3837,11 @@ class QueueList(QListWidget):
             ev.accept()
             return
         super().keyPressEvent(ev)
+
+    def dropEvent(self, ev) -> None:
+        super().dropEvent(ev)
+        if ev.isAccepted():
+            self.rowsMoved.emit()
 
 
 class MainWindow(QMainWindow):
@@ -4843,6 +4872,7 @@ class MainWindow(QMainWindow):
         self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.queue_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.queue_list.deleteRequested.connect(self._queue_delete_selected)
+        self.queue_list.rowsMoved.connect(self._queue_reordered)
         self.queue_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.queue_list.customContextMenuRequested.connect(self._show_queue_menu)
         self.queue_list.itemClicked.connect(self._on_queue_clicked)
@@ -4941,11 +4971,36 @@ class MainWindow(QMainWindow):
             else:
                 item.setSizeHint(QSize(0, 26))
             item.setToolTip(p)
+            item.setData(Qt.ItemDataRole.UserRole, p)
             self.queue_list.addItem(item)
         self.queue_list.blockSignals(False)
         if 0 <= self.queue_index < len(self.queue_paths):
             self.queue_list.setCurrentRow(self.queue_index)
         self.lbl_queue_count.setText(f"{len(self.queue_paths)}")
+
+    def _queue_reordered(self) -> None:
+        """Syncs queue_paths after a drag & drop move; the open shot stays open."""
+        order = [
+            str(self.queue_list.item(i).data(Qt.ItemDataRole.UserRole))
+            for i in range(self.queue_list.count())
+        ]
+        if not order or len(order) != len(set(order)):
+            self._queue_refresh()  # pathological drop state — rebuild canonical list
+            return
+        cur = (
+            self.queue_paths[self.queue_index]
+            if 0 <= self.queue_index < len(self.queue_paths)
+            else None
+        )
+        self.queue_paths = order
+        if cur is not None and cur in self.queue_paths:
+            self.queue_index = self.queue_paths.index(cur)
+        for i in range(self.queue_list.count()):
+            it = self.queue_list.item(i)
+            it.setText(f"{i + 1}.  {Path(str(it.data(Qt.ItemDataRole.UserRole))).name}")
+        if 0 <= self.queue_index < len(self.queue_paths):
+            self.queue_list.setCurrentRow(self.queue_index)
+        self.statusBar().showMessage("Shot list reordered")
 
     def _toggle_queue_thumbs(self, on: bool) -> None:
         self._settings["queue_thumbs"] = bool(on)
@@ -5544,9 +5599,15 @@ class MainWindow(QMainWindow):
             last = max(self.project.frame_count - 1, 0)
             # Some backends park at EndOfMedia without position() ever passing
             # the last frame — treat that as end-of-video for looping too.
+            # Others cap position() exactly at duration without ever raising
+            # EndOfMedia, so also flag 'close enough to the end'.
             try:
                 from PySide6.QtMultimedia import QMediaPlayer as _QMP
-                at_end = self._player.mediaStatus() == _QMP.MediaStatus.EndOfMedia
+                pos = int(self._player.position())
+                dur = int(self._player.duration())
+                at_end = self._player.mediaStatus() == _QMP.MediaStatus.EndOfMedia or (
+                    dur > 0 and pos >= dur - 40
+                )
             except Exception:
                 at_end = False
             if frame > last or at_end:
