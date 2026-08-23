@@ -2209,8 +2209,14 @@ def make_tool_icon(kind: str, on: bool = True) -> QIcon:
     elif kind == "plus":
         p.drawLine(QPointF(16, 8), QPointF(16, 24))
         p.drawLine(QPointF(8, 16), QPointF(24, 16))
-    elif kind == "minus":
-        p.drawLine(QPointF(8, 16), QPointF(24, 16))
+    elif kind == "pen":
+        p.save()
+        p.translate(16, 16)
+        p.rotate(-45)
+        p.drawRect(QRectF(-3.5, -12, 7, 17))
+        p.setBrush(col)
+        p.drawPolygon([QPointF(-3.5, 5), QPointF(3.5, 5), QPointF(0, 12.5)])
+        p.restore()
     elif kind == "play":
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(col)
@@ -2343,6 +2349,7 @@ ICONS_DIR = APP_DIR / "icons"
 
 # name -> human-readable description (also written to icons/names.txt)
 ICON_NAMES: dict[str, str] = {
+    "pen": "Pen / eraser tool",
     "eye": "Show / hide notes",
     "trash": "Clear drawings on this frame",
     "loop": "Loop playback",
@@ -2350,7 +2357,6 @@ ICON_NAMES: dict[str, str] = {
     "play": "Play",
     "pause": "Pause",
     "plus": "Add files / frames",
-    "minus": "Remove frames",
     "open": "Open shot list folder",
     "save": "Save scene",
     "x": "Close / remove item",

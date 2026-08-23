@@ -1,6 +1,7 @@
 InkIt icon folder — replace any .png to reskin that button.
 Delete a png to restore the built-in vector art on next start.
 
+pen.png  |  Pen / eraser tool
 eye.png  |  Show / hide notes
 trash.png  |  Clear drawings on this frame
 loop.png  |  Loop playback
@@ -8,7 +9,6 @@ audio.png  |  Audio playback toggle
 play.png  |  Play
 pause.png  |  Pause
 plus.png  |  Add files / frames
-minus.png  |  Remove frames
 open.png  |  Open shot list folder
 save.png  |  Save scene
 x.png  |  Close / remove item
