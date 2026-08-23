@@ -1756,11 +1756,12 @@ class OnionButton(QWidget):
     toggled = Signal(bool)          # onion on/off after a click
     opacityChanged = Signal(int)    # ghost visibility percent
 
-    def __init__(self, value: int = 35, parent=None) -> None:
+    def __init__(self, value: int = 35, radius: int = 0, parent=None) -> None:
         super().__init__(parent)
         self.minimum = 5
         self.maximum = 100
         self._value = min(max(int(value), self.minimum), self.maximum)
+        self.radius = max(0, int(radius))
         self.on = False
         self._press_pos = None
         self._last_x = 0.0
@@ -1801,14 +1802,23 @@ class OnionButton(QWidget):
             base, fill = QColor("#4a4a55"), QColor("#3a3a44")
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(base)
-        p.drawRoundedRect(r, 4, 4)
+
+        def paint_body() -> None:
+            if self.radius > 0:
+                path = QPainterPath()
+                path.addRoundedRect(r, float(self.radius), float(self.radius))
+                p.drawPath(path)
+            else:
+                p.drawRect(r)
+
+        paint_body()
         span = max(1, self.maximum - self.minimum)
         fw = ((self._value - self.minimum) / span) * (self.width() - 2)
         if fw > 0.5:
             p.save()
             p.setClipRect(QRectF(1, 1, fw, self.height() - 2))
             p.setBrush(fill)
-            p.drawRoundedRect(r, 4, 4)
+            paint_body()
             p.restore()
         # Onion skinning icon (centered) instead of text; fill bar still shows %
         col = QColor("#eeeeee")
