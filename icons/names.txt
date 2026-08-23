@@ -1,0 +1,30 @@
+InkIt icon folder — replace any .png to reskin that button.
+Delete a png to restore the built-in vector art on next start.
+
+eye.png  |  Show / hide notes
+trash.png  |  Clear drawings on this frame
+loop.png  |  Loop playback
+audio.png  |  Audio playback toggle
+play.png  |  Play
+pause.png  |  Pause
+plus.png  |  Add files / frames
+minus.png  |  Remove frames
+open.png  |  Open shot list folder
+save.png  |  Save scene
+x.png  |  Close / remove item
+view_nav.png  |  Zoom / Pan / Reset view
+onion.png  |  Onion skin toggle
+bg.png  |  Board background color
+grid.png  |  Thumbnails toggle
+picker.png  |  Color picker (eyedropper)
+slider_hardness.png  |  Brush hardness slider logo
+slider_opacity.png  |  Pen opacity slider logo
+slider_clip.png  |  Clip opacity slider logo
+slider_notes.png  |  Notes opacity slider logo
+nav_prev.png  |  Previous frame (<)
+nav_next.png  |  Next frame (>)
+nav_prev_dot.png  |  Jump to previous drawing (|<)
+nav_next_dot.png  |  Jump to next drawing (>||)
+
+Painted in code (no icon file): audio volume button,
+pen/eraser size button, onion spin pills, eyedropper pointer.
