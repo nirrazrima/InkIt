@@ -4066,10 +4066,11 @@ class MainWindow(QMainWindow):
         def restyle_spins() -> None:
             c = self._colors()
 
-            def spin_ss(radius: str) -> str:
+            def spin_ss(radius: str, side: str) -> str:
                 return (
                     "QSpinBox { background: transparent;"
-                    f" border: 1px solid {c['border']}; border-radius: {radius};"
+                    f" border: 1px solid {c['border']}; border-{side}: none;"
+                    f" border-radius: {radius};"
                     f" color: {c['text']}; font-size: 13px;"
                     " padding: 0 11px 0 2px; }"
                     "QSpinBox QLineEdit { background: transparent;"
@@ -4080,14 +4081,22 @@ class MainWindow(QMainWindow):
                     f"QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {c['card_hover']}; }}"
                 )
 
-            # inner edges square so [prev][onion][next] reads as one block
-            self.spin_onion_prev.setStyleSheet(spin_ss("6px 0 0 6px"))
-            self.spin_onion_next.setStyleSheet(spin_ss("0 6px 6px 0"))
+            # one seamless capsule: outer corners round, touching edges borderless
+            self.spin_onion_prev.setStyleSheet(spin_ss("8px 0 0 8px", "right"))
+            self.spin_onion_next.setStyleSheet(spin_ss("0 8px 8px 0", "left"))
 
         restyle_spins()
         self._dyn_styles.append(restyle_spins)
-        # before-count | onion | after-count in one flat strip, view nav far right
-        bar.addWidget(self._tool_group(self.spin_onion_prev, self.btn_onion, self.spin_onion_next))
+        # [before-count][onion][after-count] fused into one capsule, view nav far right
+        strip = QFrame()
+        strip.setObjectName("onionStrip")
+        slay = QHBoxLayout(strip)
+        slay.setContentsMargins(0, 0, 0, 0)
+        slay.setSpacing(0)
+        slay.addWidget(self.spin_onion_prev)
+        slay.addWidget(self.btn_onion)
+        slay.addWidget(self.spin_onion_next)
+        bar.addWidget(strip)
         bar.addWidget(self._tool_group(self.btn_view))
 
         layout.addWidget(wrap)
