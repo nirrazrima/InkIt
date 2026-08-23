@@ -1911,29 +1911,74 @@ class ColorSwatch(QPushButton):
             super().mouseDoubleClickEvent(ev)
 
 
-class GlyphSpin(QSpinBox):
-    """Spinbox that always paints its own chunky +/− stepper glyphs."""
+class ValueBox(QWidget):
+    """Compact inline −/+ value box, 0-10 range (user-chosen toolbar design)."""
 
-    BTN_W = 9
+    valueChanged = Signal(int)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, initial: int = 0, minimum: int = 0, maximum: int = 10, parent=None) -> None:
         super().__init__(parent)
-        self.setButtonSymbols(QSpinBox.ButtonSymbols.PlusMinus)
+        self._min = int(minimum)
+        self._max = int(maximum)
+        self._value = min(max(int(initial), self._min), self._max)
 
-    def paintEvent(self, ev) -> None:
-        super().paintEvent(ev)
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        w, h = self.width(), self.height()
-        bw, bh = self.BTN_W, h // 2
-        pen = QPen(QColor("#e6e6e6"), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        cx = w - bw // 2
-        cy_up, cy_dn = bh / 2, h - bh / 2
-        L = 3.375
-        p.drawLine(QPointF(cx - L, cy_up), QPointF(cx + L, cy_up))
-        p.drawLine(QPointF(cx, cy_up - L), QPointF(cx, cy_up + L))
-        p.drawLine(QPointF(cx - L, cy_dn), QPointF(cx + L, cy_dn))
+        self.setStyleSheet(
+            "ValueBox { background-color:#2b2b2b; border:1px solid #4a4a4a;"
+            " border-radius:6px; }"
+        )
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.minus_btn = QPushButton("−")
+        self.plus_btn = QPushButton("+")
+        self.display = QLabel(str(self._value))
+        self.display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.display.setFixedWidth(22)
+        self.display.setStyleSheet(
+            "color:white; font-size:12px; font-weight:bold; background:transparent;"
+        )
+
+        for b in (self.minus_btn, self.plus_btn):
+            b.setFixedSize(19, 28)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                "QPushButton { background-color:transparent; color:#ccc; border:none;"
+                " font-size:11px; }"
+                "QPushButton:hover { background-color:#3c3c3c; }"
+                "QPushButton:pressed { background-color:#5285a6; color:white; }"
+            )
+
+        lay.addWidget(self.minus_btn)
+        lay.addWidget(self.display)
+        lay.addWidget(self.plus_btn)
+        self.setFixedSize(60, 30)
+
+        self.minus_btn.clicked.connect(self.decrement)
+        self.plus_btn.clicked.connect(self.increment)
+        self._refresh_button_states()
+
+    def value(self) -> int:
+        return self._value
+
+    def setValue(self, v: int) -> None:
+        v = max(self._min, min(self._max, int(v)))
+        if v != self._value:
+            self._value = v
+            self.display.setText(str(v))
+            self.valueChanged.emit(v)
+        self._refresh_button_states()
+
+    def increment(self) -> None:
+        self.setValue(self._value + 1)
+
+    def decrement(self) -> None:
+        self.setValue(self._value - 1)
+
+    def _refresh_button_states(self) -> None:
+        self.plus_btn.setEnabled(self._value < self._max)
+        self.minus_btn.setEnabled(self._value > self._min)
 
 
 class VolumeButton(QPushButton):
@@ -4047,56 +4092,22 @@ class MainWindow(QMainWindow):
         self.btn_onion.setToolTip("Onion skin — click to toggle, drag to set ghost visibility %")
         self.btn_onion.toggled.connect(self._toggle_onion)
         self.btn_onion.opacityChanged.connect(self._onion_opacity_changed)
-        def onion_spin(tip: str) -> GlyphSpin:
-            """Compact frameless ghost-count spinner with chunky +/- steppers."""
-            sp = GlyphSpin()
-            sp.setRange(0, 10)
-            sp.setValue(1)
-            sp.setToolTip(tip)
-            sp.setFixedWidth(48)
-            sp.setFixedHeight(30)
-            sp.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            return sp
-
-        self.spin_onion_prev = onion_spin("Ghost this many drawings BEFORE the current one")
+        self.spin_onion_prev = ValueBox(initial=1, minimum=0, maximum=10)
+        self.spin_onion_prev.setToolTip("Ghost this many drawings BEFORE the current one")
         self.spin_onion_prev.valueChanged.connect(self._onion_depth_changed)
-        self.spin_onion_next = onion_spin("Ghost this many drawings AFTER the current one")
+        self.spin_onion_next = ValueBox(initial=1, minimum=0, maximum=10)
+        self.spin_onion_next.setToolTip("Ghost this many drawings AFTER the current one")
         self.spin_onion_next.valueChanged.connect(self._onion_depth_changed)
 
-        def restyle_spins() -> None:
-            c = self._colors()
-
-            def spin_ss(radius: str, side: str) -> str:
-                return (
-                    "QSpinBox { background: transparent;"
-                    f" border: 1px solid {c['border']}; border-{side}: none;"
-                    f" border-radius: {radius};"
-                    f" color: {c['text']}; font-size: 13px;"
-                    " padding: 0 11px 0 2px; }"
-                    "QSpinBox QLineEdit { background: transparent;"
-                    f" color: {c['text']}; border: none; }}"
-                    "QSpinBox::up-button, QSpinBox::down-button {"
-                    f" width: 9px; background: transparent;"
-                    f" border-left: 1px solid {c['border']};}}"
-                    f"QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {c['card_hover']}; }}"
-                )
-
-            # one seamless capsule: outer corners round, touching edges borderless
-            self.spin_onion_prev.setStyleSheet(spin_ss("8px 0 0 8px", "right"))
-            self.spin_onion_next.setStyleSheet(spin_ss("0 8px 8px 0", "left"))
-
-        restyle_spins()
-        self._dyn_styles.append(restyle_spins)
-        # [before-count][onion][after-count] fused into one capsule, view nav far right
-        strip = QFrame()
-        strip.setObjectName("onionStrip")
-        slay = QHBoxLayout(strip)
-        slay.setContentsMargins(0, 0, 0, 0)
-        slay.setSpacing(0)
-        slay.addWidget(self.spin_onion_prev)
-        slay.addWidget(self.btn_onion)
-        slay.addWidget(self.spin_onion_next)
-        bar.addWidget(strip)
+        # [− n +]  onion button (existing painted icon)  [− n +]
+        cluster = QWidget()
+        clay = QHBoxLayout(cluster)
+        clay.setContentsMargins(0, 0, 0, 0)
+        clay.setSpacing(6)
+        clay.addWidget(self.spin_onion_prev)
+        clay.addWidget(self.btn_onion)
+        clay.addWidget(self.spin_onion_next)
+        bar.addWidget(cluster)
         bar.addWidget(self._tool_group(self.btn_view))
 
         layout.addWidget(wrap)
