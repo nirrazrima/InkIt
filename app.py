@@ -1921,6 +1921,8 @@ class ValueBox(QWidget):
         self._min = int(minimum)
         self._max = int(maximum)
         self._value = min(max(int(initial), self._min), self._max)
+        # QWidget subclasses skip QSS backgrounds/borders without this flag
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         self.setStyleSheet(
             "ValueBox { background-color:#2b2b2b; border:1px solid #4a4a4a;"
@@ -4087,7 +4089,8 @@ class MainWindow(QMainWindow):
         )
         self.btn_view.toggled.connect(self._nav_mode_changed)
         self.btn_onion = OnionButton(
-            value=min(max(int(self._settings.get("onion_opacity", 35)), 5), 100)
+            value=min(max(int(self._settings.get("onion_opacity", 35)), 5), 100),
+            radius=5,  # matches the pen button's corner rounding
         )
         self.btn_onion.setToolTip("Onion skin — click to toggle, drag to set ghost visibility %")
         self.btn_onion.toggled.connect(self._toggle_onion)
