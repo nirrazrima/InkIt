@@ -14,7 +14,6 @@ save.png  |  Save scene
 x.png  |  Close / remove item
 view_nav.png  |  Zoom / Pan / Reset view
 onion.png  |  Onion skin toggle
-bg.png  |  Board background color
 grid.png  |  Thumbnails toggle
 picker.png  |  Color picker (eyedropper)
 slider_hardness.png  |  Brush hardness slider logo

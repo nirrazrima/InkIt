@@ -111,6 +111,7 @@ from PySide6.QtGui import (
     QImage,
     QKeySequence,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QPolygonF,
@@ -1599,6 +1600,11 @@ class ToolButton(QWidget):
         num_w = max(fm.horizontalAdvance(str(self.maximum)), fm.horizontalAdvance(str(self.minimum)))
         self.setFixedSize(int(num_w) + 48, 34)  # a bit bigger than the other boxes
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # User-supplied pen.png (icons folder) replaces the built-in pencil glyph
+        self._user_pen_pm: QPixmap | None = None
+        upen = ICONS_DIR / "pen.png"
+        if upen.is_file():
+            self._user_pen_pm = QPixmap(str(upen))
 
     # -- public API ---------------------------------------------------------
     def setTool(self, tool: str) -> None:
@@ -1625,6 +1631,8 @@ class ToolButton(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
+        body = QPainterPath()
+        body.addRoundedRect(r, 5.0, 5.0)  # same rounding as the eyedropper button
         # Solid tool color; size fill is two shades darker so the level reads
         if self.tool == "pen":
             base, fill = QColor("#3d5afe"), QColor("#2a3ec4")
@@ -1632,21 +1640,26 @@ class ToolButton(QWidget):
             base, fill = QColor("#ff9f43"), QColor("#c97a1e")
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(base)
-        p.drawRect(r)
+        p.drawPath(body)
         span = max(1, self.maximum - self.minimum)
         fw = ((self._value - self.minimum) / span) * (self.width() - 2)
         if fw > 0.5:
             p.save()
             p.setClipRect(QRectF(1, 1, fw, self.height() - 2))
             p.setBrush(fill)
-            p.drawRect(r)
+            p.drawPath(body)
             p.restore()
         f = self.font()
         f.setBold(True)
         p.setFont(f)
         p.setPen(QColor("#ffffff"))
-        # Tool glyph on the left, plain size number on the right
-        self._draw_tool_icon(p, 17.0, self.height() / 2.0)
+        # Tool glyph on the left (user png wins), plain size number on the right
+        if self.tool == "pen" and self._user_pen_pm is not None and not self._user_pen_pm.isNull():
+            pm = self._user_pen_pm
+            side = 22.0
+            p.drawPixmap(QRectF(17.0 - side / 2.0, self.height() / 2.0 - side / 2.0, side, side).toRect(), pm)
+        else:
+            self._draw_tool_icon(p, 17.0, self.height() / 2.0)
         num = str(self._value)
         nw = p.fontMetrics().horizontalAdvance(num)
         p.drawText(
@@ -2275,12 +2288,6 @@ def make_tool_icon(kind: str, on: bool = True) -> QIcon:
         p.drawRect(QRectF(21, 11, 9, 12))
         p.setPen(QPen(col, 2.4))
         p.drawRect(QRectF(9, 6, 14, 20))
-    elif kind == "bg":
-        p.setPen(QPen(col, 2.2))
-        p.drawRect(QRectF(6, 6, 20, 20))
-        p.setBrush(col)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRect(QRectF(8, 16, 16, 8))
     elif kind == "grid":
         # Thumbnail grid toggle (shot list): 2x2 tiles
         p.drawRect(QRectF(6, 6, 8, 8))
@@ -2362,7 +2369,6 @@ ICON_NAMES: dict[str, str] = {
     "x": "Close / remove item",
     "view_nav": "Zoom / Pan / Reset view",
     "onion": "Onion skin toggle",
-    "bg": "Board background color",
     "grid": "Thumbnails toggle",
     "picker": "Color picker (eyedropper)",
     "slider_hardness": "Brush hardness slider logo",
