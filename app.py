@@ -75,12 +75,25 @@ from __future__ import annotations
 import ctypes
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Packaged (Nuitka) bootstrap: point Qt at plugins bundled next to the exe.
+# Dev runs never hit this — "__compiled__" only exists under Nuitka.
+if "__compiled__" in globals():
+    _base = os.path.dirname(os.path.abspath(__file__))
+    _qplug = os.path.join(_base, "QtPlugins")
+    if os.path.isdir(_qplug):
+        os.environ["QT_PLUGIN_PATH"] = _qplug
+        try:
+            os.add_dll_directory(_qplug)
+        except OSError:
+            pass
 
 import cv2
 import numpy as np
@@ -6167,6 +6180,10 @@ class MainWindow(QMainWindow):
 
 def register_inkit_association() -> None:
     """Registers .inkit file type association with Windows Registry."""
+    if "__compiled__" in globals():
+        # Packaged (Nuitka onefile): the exe lives in a temp extraction dir,
+        # so a Start Menu-style association would point at a volatile path.
+        return
     try:
         import winreg
     except Exception:

@@ -15,6 +15,7 @@ if os.path.exists(ffmpeg_bin):
 datas = [
     ("icon.ico", "."),
     ("icon.png", "."),
+    ("icons", "icons"),
 ]
 
 hiddenimports = [
