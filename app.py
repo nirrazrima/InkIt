@@ -3759,13 +3759,14 @@ class ExportWorker(QThread):
     failed = Signal(str)
     finished_ok = Signal(str)
 
-    def __init__(self, video_path: str, project: Project, dest: str, export_audio: bool = True, antialias: bool = True) -> None:
+    def __init__(self, video_path: str, project: Project, dest: str, export_audio: bool = True, antialias: bool = True, strokes_snapshot: dict | None = None) -> None:
         super().__init__()
         self.video_path = video_path
         self.project = project
         self.dest = dest
         self.export_audio = export_audio
         self.antialias = antialias
+        self._strokes_snapshot = strokes_snapshot
 
     def _encode(self, w: int, h: int, fps: float, with_audio: bool) -> tuple[int, str]:
         vcodec = [
@@ -3806,7 +3807,7 @@ class ExportWorker(QThread):
                     break
                 if frame.shape[1] != w or frame.shape[0] != h:
                     frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-                strokes = self.project.strokes.get(i, [])
+                strokes = self._strokes_snapshot.get(i, []) if self._strokes_snapshot else self.project.strokes.get(i, [])
                 if strokes:
                     frame = render_annotations_on_bgr(frame, strokes, antialias=self.antialias)
                 proc.stdin.write(np.ascontiguousarray(frame).tobytes())
@@ -5698,12 +5699,17 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        # Finalize any in-progress stroke so it's in the project
+        self.canvas._end()
+        # Snapshot strokes for the worker to avoid cross-thread dict access
+        strokes_snapshot = {f: list(strokes) for f, strokes in self.project.strokes.items()}
         self._progress = QProgressDialog("Exporting…", "Hide", 0, 100, self)
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._progress.setMinimumDuration(0)
         self._worker = ExportWorker(
             self.project.path, self.project, path,
             export_audio=self.export_audio, antialias=bool(self.canvas.antialias),
+            strokes_snapshot=strokes_snapshot,
         )
         self._worker.progress.connect(self._progress.setValue)
         self._worker.failed.connect(self._export_fail)
