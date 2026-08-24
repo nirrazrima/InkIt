@@ -3710,8 +3710,26 @@ def render_annotations_on_bgr(bgr: np.ndarray, strokes: list[Stroke], antialias:
     p = QPainter(img)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, bool(antialias))
     r = QRectF(0, 0, w, h)
-    dummy = Canvas.__new__(Canvas)
-    dummy.antialias = bool(antialias)
+
+    # Create a minimal canvas-like object with the correct page scale for export.
+    # The page space is normalized (0-1) and should map 1:1 to the frame pixels.
+    class _ExportCanvas:
+        antialias = bool(antialias)
+        _zoom = 1.0
+        _pan = QPointF(0.0, 0.0)
+        project = type('obj', (object,), {'width': w, 'height': h})()
+        
+        def _fit(self) -> QRectF:
+            return QRectF(0, 0, w, h)
+        
+        def _fit_base_width(self) -> float:
+            return float(w)
+        
+        def _page_scale(self, rect: QRectF) -> float:
+            return rect.width() / w if w > 0 else 1.0
+
+    dummy = _ExportCanvas()
+
     for s in strokes:
         Canvas._paint_stroke(dummy, p, s, r)
     p.end()
