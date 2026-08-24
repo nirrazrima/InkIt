@@ -3702,7 +3702,7 @@ class Canvas(QWidget):
 # 8. VIDEO EXPORT ENGINE
 # ===========================================================================
 
-def render_annotations_on_bgr(bgr: np.ndarray, strokes: list[Stroke], antialias: bool = True) -> np.ndarray:
+def render_annotations_on_bgr(bgr: np.ndarray, strokes: list[Stroke], antialias: bool = True, notes_opacity: float = 1.0) -> np.ndarray:
     """Renders vector stroke annotations directly on an OpenCV BGR frame array with alpha blending."""
     h, w = bgr.shape[:2]
     img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
@@ -3745,9 +3745,28 @@ def render_annotations_on_bgr(bgr: np.ndarray, strokes: list[Stroke], antialias:
     arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, w, 4)).copy()
     overlay_bgra = arr
     alpha = overlay_bgra[:, :, 3:4].astype(np.float32) / 255.0
-    bgr_o = overlay_bgra[:, :, 0:3].astype(np.float32)
-    out = bgr.astype(np.float32) * (1.0 - alpha) + bgr_o * alpha
+    # Apply global notes opacity (canvas slider) as extra alpha multiplier
+    notes_opacity = float(max(0.0, min(1.0, notes_opacity)))
+    if notes_opacity < 0.995:
+        alpha = alpha * notes_opacity
+        # bgr_o is premultiplied — scale RGB by same factor to keep premultiplication correct
+        overlay_bgra[:, :, 0:3] = (overlay_bgra[:, :, 0:3].astype(np.float32) * notes_opacity).astype(np.uint8)
+        bgr_o = overlay_bgra[:, :, 0:3].astype(np.float32)
+    else:
+        bgr_o = overlay_bgra[:, :, 0:3].astype(np.float32)
+    # overlay is premultiplied: out = bgr*(1-alpha) + bgr_o
+    out = bgr.astype(np.float32) * (1.0 - alpha) + bgr_o
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _fade_bgr(frame_shape, fade_hex: str) -> np.ndarray:
+    """Solid BGR image of fade_color for clip-opacity blending."""
+    c = QColor(fade_hex)
+    b, g, r = c.blue(), c.green(), c.red()
+    h, w = frame_shape[:2]
+    arr = np.empty((h, w, 3), dtype=np.uint8)
+    arr[:, :] = (b, g, r)
+    return arr
 
 
 class ExportWorker(QThread):
@@ -3759,7 +3778,7 @@ class ExportWorker(QThread):
     failed = Signal(str)
     finished_ok = Signal(str)
 
-    def __init__(self, video_path: str, project: Project, dest: str, export_audio: bool = True, antialias: bool = True, strokes_snapshot: dict | None = None) -> None:
+    def __init__(self, video_path: str, project: Project, dest: str, export_audio: bool = True, antialias: bool = True, strokes_snapshot: dict | None = None, clip_opacity: float = 1.0, fade_color: str = "#ffffff", notes_opacity: float = 1.0) -> None:
         super().__init__()
         self.video_path = video_path
         self.project = project
@@ -3767,6 +3786,9 @@ class ExportWorker(QThread):
         self.export_audio = export_audio
         self.antialias = antialias
         self._strokes_snapshot = strokes_snapshot
+        self.clip_opacity = float(max(0.0, min(1.0, clip_opacity)))
+        self.fade_color = str(fade_color or "#ffffff")
+        self.notes_opacity = float(max(0.0, min(1.0, notes_opacity)))
 
     def _encode(self, w: int, h: int, fps: float, with_audio: bool) -> tuple[int, str]:
         vcodec = [
@@ -3807,9 +3829,16 @@ class ExportWorker(QThread):
                     break
                 if frame.shape[1] != w or frame.shape[0] != h:
                     frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-                strokes = self._strokes_snapshot.get(i, []) if self._strokes_snapshot else self.project.strokes.get(i, [])
+                # Apply clip opacity vs fade_color (matches Canvas.paintEvent fillRect+setOpacity)
+                if self.clip_opacity < 0.995:
+                    # blend frame towards fade_color
+                    fc = QColor(self.fade_color)
+                    fb, fg, fr = fc.blue(), fc.green(), fc.red()
+                    # fast per-frame blend
+                    frame = (frame.astype(np.float32) * self.clip_opacity + np.array([fb, fg, fr], dtype=np.float32) * (1.0 - self.clip_opacity)).astype(np.uint8)
+                strokes = self._strokes_snapshot.get(i, []) if self._strokes_snapshot is not None else self.project.strokes.get(i, [])
                 if strokes:
-                    frame = render_annotations_on_bgr(frame, strokes, antialias=self.antialias)
+                    frame = render_annotations_on_bgr(frame, strokes, antialias=self.antialias, notes_opacity=self.notes_opacity)
                 proc.stdin.write(np.ascontiguousarray(frame).tobytes())
                 i += 1
                 self.progress.emit(min(99, 1 + int(i / max(total, 1) * 98)))
@@ -5710,6 +5739,9 @@ class MainWindow(QMainWindow):
             self.project.path, self.project, path,
             export_audio=self.export_audio, antialias=bool(self.canvas.antialias),
             strokes_snapshot=strokes_snapshot,
+            clip_opacity=float(getattr(self.canvas, "clip_opacity", 1.0)),
+            fade_color=str(getattr(self.canvas, "fade_color", QColor("#ffffff")).name(QColor.NameFormat.HexRgb)) if hasattr(getattr(self.canvas, "fade_color", None), "name") else str(getattr(self.canvas, "fade_color", "#ffffff")),
+            notes_opacity=float(getattr(self.canvas, "notes_opacity", 1.0)),
         )
         self._worker.progress.connect(self._progress.setValue)
         self._worker.failed.connect(self._export_fail)
@@ -5728,9 +5760,21 @@ class MainWindow(QMainWindow):
             return
         if not Path(path).suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp"):
             path += ".png"
+        # Apply clip opacity vs fade_color to still image background before notes (like Canvas paintEvent)
+        base = self._still_bgr.copy() if self._still_bgr is not None else np.zeros((1080, 1920, 3), dtype=np.uint8)
+        clip_op = float(getattr(self.canvas, "clip_opacity", 1.0))
+        if clip_op < 0.995 and base is not None:
+            fc = getattr(self.canvas, "fade_color", QColor("#ffffff"))
+            fade_hex = fc.name(QColor.NameFormat.HexRgb) if hasattr(fc, "name") else str(fc)
+            c = QColor(fade_hex)
+            fade_bgr = np.array([c.blue(), c.green(), c.red()], dtype=np.float32)
+            base = (base.astype(np.float32) * clip_op + fade_bgr * (1.0 - clip_op)).astype(np.uint8)
+        # Ensure pending stroke finalized
+        self.canvas._end()
         out = render_annotations_on_bgr(
-            self._still_bgr, self.project.strokes.get(0, []),
+            base, self.project.strokes.get(0, []),
             antialias=bool(self.canvas.antialias),
+            notes_opacity=float(getattr(self.canvas, "notes_opacity", 1.0)),
         )
         ok = cv2.imwrite(path, out)
         if not ok:
