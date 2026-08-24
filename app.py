@@ -3714,7 +3714,6 @@ def render_annotations_on_bgr(bgr: np.ndarray, strokes: list[Stroke], antialias:
     # Create a minimal canvas-like object with the correct page scale for export.
     # The page space is normalized (0-1) and should map 1:1 to the frame pixels.
     class _ExportCanvas:
-        antialias = bool(antialias)
         _zoom = 1.0
         _pan = QPointF(0.0, 0.0)
         project = type('obj', (object,), {'width': w, 'height': h})()
@@ -3729,6 +3728,7 @@ def render_annotations_on_bgr(bgr: np.ndarray, strokes: list[Stroke], antialias:
             return rect.width() / w if w > 0 else 1.0
 
     dummy = _ExportCanvas()
+    dummy.antialias = bool(antialias)
 
     for s in strokes:
         Canvas._paint_stroke(dummy, p, s, r)
