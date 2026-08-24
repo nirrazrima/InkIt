@@ -3727,6 +3727,13 @@ def render_annotations_on_bgr(bgr: np.ndarray, strokes: list[Stroke], antialias:
         def _page_scale(self, rect: QRectF) -> float:
             return rect.width() / w if w > 0 else 1.0
 
+        # Delegate to the real Canvas implementations
+        def _stroke_geometry(self, p, s, r, col, seg_from=1):
+            return Canvas._stroke_geometry(self, p, s, r, col, seg_from)
+        
+        def _soft_stroke(self, p, s, r, col, seg_from=1):
+            return Canvas._soft_stroke(self, p, s, r, col, seg_from)
+
     dummy = _ExportCanvas()
     dummy.antialias = bool(antialias)
 
