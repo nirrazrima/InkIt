@@ -1,8 +1,13 @@
-.venv/
+﻿.venv/
 __pycache__/
 *.pyc
 backups/
 dist/
 build/
-InkItCompiled Nuitika/
 dist_pi/
+# Compiled build artifacts (keep spec/bat tracked)
+InkItCompiled Nuitika/*.exe
+InkItCompiled Nuitika/build/
+InkItCompiled Nuitika/dist/
+InkItCompiled Nuitika/__pycache__/
+InkItCompiled Nuitika/*.log

@@ -13,9 +13,9 @@ if os.path.exists(ffmpeg_bin):
     binaries.append((ffmpeg_bin, "."))
 
 datas = [
-    ("icon.ico", "."),
-    ("icon.png", "."),
-    ("icons", "icons"),
+    ("../icon.ico", "."),
+    ("../icon.png", "."),
+    ("../icons", "icons"),
 ]
 
 hiddenimports = [
@@ -82,8 +82,8 @@ excludes = [
 ]
 
 a = Analysis(
-    ["app.py"],
-    pathex=["."],
+    ["../app.py"],
+    pathex=[".."],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -119,5 +119,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon="icon.ico",
+    icon="../icon.ico",
 )
