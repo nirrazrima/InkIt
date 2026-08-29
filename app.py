@@ -76,6 +76,7 @@ import ctypes
 import json
 import math
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -130,6 +131,7 @@ from PySide6.QtGui import (
     QPolygonF,
     QPointingDevice,
     QRadialGradient,
+    QShortcut,
     QTabletEvent,
     QTransform,
     QWheelEvent,
@@ -146,6 +148,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
@@ -157,6 +160,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QProgressDialog,
     QPushButton,
+    QSizeGrip,
     QSizePolicy,
     QSlider,
     QStackedWidget,
@@ -169,6 +173,7 @@ from PySide6.QtWidgets import (
     QStyleOptionSlider,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -516,9 +521,14 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "play_pause": "Space",
     "prev_frame": "Left",
     "next_frame": "Right",
-    "prev_drawing": "Up",
-    "next_drawing": "Down",
+    "prev_drawing": "Down",
+    "next_drawing": "Up",
     "toggle_loop": "L",
+    # -- Pen colors ----------------------------------------------------
+    "pen_color_1": "1",
+    "pen_color_2": "2",
+    "pen_color_3": "3",
+    "pen_color_4": "4",
 }
 
 ACTION_LABELS: dict[str, str] = {
@@ -551,6 +561,10 @@ ACTION_LABELS: dict[str, str] = {
     "prev_drawing": "Previous drawing",
     "next_drawing": "Next drawing",
     "toggle_loop": "Loop playback",
+    "pen_color_1": "Pen color 1",
+    "pen_color_2": "Pen color 2",
+    "pen_color_3": "Pen color 3",
+    "pen_color_4": "Pen color 4",
 }
 
 # Status-bar sentence shown while hovering the control (and used in tooltips).
@@ -584,6 +598,10 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "prev_drawing": "Jump to the previous drawing",
     "next_drawing": "Jump to the next drawing",
     "toggle_loop": "Loop playback at the end",
+    "pen_color_1": "Switch to pen color slot 1",
+    "pen_color_2": "Switch to pen color slot 2",
+    "pen_color_3": "Switch to pen color slot 3",
+    "pen_color_4": "Switch to pen color slot 4",
 }
 
 # Toolbar/playback buttons linked to their action keys (tooltip + status bar).
@@ -2413,6 +2431,15 @@ def make_tool_icon(kind: str, on: bool = True) -> QIcon:
             p.setBrush(col)
         p.drawRect(QRectF(6, 18, 8, 8))
         p.drawRect(QRectF(18, 18, 8, 8))
+    elif kind == "pip":
+        p.drawRect(QRectF(4, 6, 24, 18))
+        r = QRectF(16, 14, 10, 8)
+        p.setBrush(col)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRect(r)
+        p.setPen(QPen(QColor("#1a1a1c"), 1.2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(r)
     p.end()
     return QIcon(pm)
 
@@ -2633,6 +2660,11 @@ def default_settings() -> dict:
         "recent_saved": [],
         "pen_recent": ["#ff3b30", "#ffcc00", "#34c759", "#007aff", "#ffffff", "#000000"],
         "fade_recent": ["#ffffff", "#000000", "#888888"],
+        "maya_sync": False,
+        "maya_offset": 10045,
+        "maya_offsets": {},
+        "maya_port": 6005,
+        "maya_send_port": 6006,
     }
 
 
@@ -2765,6 +2797,7 @@ class Canvas(QWidget):
         self._rendered = 0                      # Points of active stroke already painted
         self._ghost_cache: dict = {}            # LRU {frame: (QImage, sig)} for onion ghosts
         self._ghost_gkey = None                 # invalidation key for _ghost_cache
+        self._resize_suppress = False           # live-resize: reuse last stroke cache
 
     def set_nav_mode(self, on: bool) -> None:
         """Activates the toolbar View nav gestures (False disables)."""
@@ -3000,26 +3033,32 @@ class Canvas(QWidget):
             self._draw_onion(p)
 
         # Composite cached layers: finished strokes + in-progress stroke (incremental)
-        self._ensure_cache()
-        self._ensure_active()
-        p.setOpacity(self.notes_opacity)
-        if (
-            self._drawing and self._stroke is not None and self._stroke.eraser
-            and self._committed is not None
-        ):
-            combined = QImage(self._committed)
-            cp = QPainter(combined)
-            cp.setRenderHint(QPainter.RenderHint.Antialiasing, bool(getattr(self, "antialias", True)))
-            cp.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            self._stroke_geometry(cp, self._stroke, self._dst, QColor(0, 0, 0, 255))
-            cp.end()
-            p.drawImage(0, 0, combined)
+        if not (self._resize_suppress and self._committed is not None and not self._drawing):
+            self._ensure_cache()
+            self._ensure_active()
+            p.setOpacity(self.notes_opacity)
+            if (
+                self._drawing and self._stroke is not None and self._stroke.eraser
+                and self._committed is not None
+            ):
+                combined = QImage(self._committed)
+                cp = QPainter(combined)
+                cp.setRenderHint(QPainter.RenderHint.Antialiasing, bool(getattr(self, "antialias", True)))
+                cp.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+                self._stroke_geometry(cp, self._stroke, self._dst, QColor(0, 0, 0, 255))
+                cp.end()
+                p.drawImage(0, 0, combined)
+            else:
+                if self._committed is not None:
+                    p.drawImage(0, 0, self._committed)
+                if self._active is not None and self._drawing and self._stroke is not None:
+                    p.setOpacity(self.notes_opacity * min(max(self._stroke.opacity, 0.0), 1.0))
+                    p.drawImage(0, 0, self._active)
         else:
-            if self._committed is not None:
-                p.drawImage(0, 0, self._committed)
-            if self._active is not None and self._drawing and self._stroke is not None:
-                p.setOpacity(self.notes_opacity * min(max(self._stroke.opacity, 0.0), 1.0))
-                p.drawImage(0, 0, self._active)
+            # Live resizing: reuse the last stroke render (scaled) for snappy
+            # feedback; the accurate cache rebuild runs once the resize settles.
+            p.setOpacity(self.notes_opacity)
+            p.drawImage(self.rect(), self._committed)
 
         # Frame counter HUD (screen-only; never part of exports)
         self._draw_frame_hud(p)
@@ -3912,6 +3951,969 @@ class QueueList(QListWidget):
             self.rowsMoved.emit()
 
 
+class _PipPaintShim:
+    """Minimal Canvas-like provider so Canvas stroke painters work off-canvas
+    (same delegation trick as the export renderer)."""
+
+    antialias = True
+
+    def __init__(self, r: QRectF, native_w: float, native_h: float):
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self.project = type("obj", (object,), {"width": int(native_w), "height": int(native_h)})()
+        self._r = QRectF(r)
+        self._native_w = float(max(native_w, 1))
+
+    def _fit(self) -> QRectF:
+        return QRectF(self._r)
+
+    def _fit_base_width(self) -> float:
+        return self._native_w
+
+    def _page_scale(self, rect: QRectF) -> float:
+        return rect.width() / self._native_w if self._native_w > 0 else 1.0
+
+    def _stroke_geometry(self, p: QPainter, s: Stroke, r: QRectF, col: QColor, seg_from: int = 1) -> None:
+        Canvas._stroke_geometry(self, p, s, r, col, seg_from)
+
+    def _soft_stroke(self, p: QPainter, s: Stroke, r: QRectF, col: QColor, seg_from: int = 1) -> None:
+        Canvas._soft_stroke(self, p, s, r, col, seg_from)
+
+
+class PipWindow(QWidget):
+    """Frameless always-on-top mini player.
+
+    - Mirrors the video WITH annotations (same stroke engine as the canvas)
+    - Shows only the timeline slider + frame/time readout (always visible)
+    - ALL app shortcuts work here (replicated as widget-scope shortcuts)
+    - Floating pen button toggles draw-over-video mode (strokes land on the
+      current frame of the same project, autosaved like normal notes)
+    """
+
+    def __init__(self, main_win: "MainWindow"):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.main_win = main_win
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setMouseTracking(True)
+        self.setTabletTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.resize(480, 270)
+        self.setMinimumSize(240, 160)
+        self._drag_pos = None
+        self._mouse_inside = False
+        # drawing state
+        self._draw_mode = False
+        self._stroke: Stroke | None = None
+        self._temp_eraser = False
+        self._dst = QRectF()
+        # layered renderer caches
+        self._video_key = None
+        self._video_img: QImage | None = None
+        self._ink: QImage | None = None          # committed strokes layer
+        self._ink_key = None
+        self._active: QImage | None = None       # in-progress stroke layer
+        self._n_rend = 0
+        self._marks_tick = 0
+        self._last_frame = -1
+        self._last_tool = None
+        self._scrub_x = None
+        self._scrub_frame = 0
+        # view navigation — mirrors the main canvas (shared _zoom/_pan):
+        # Alt+Right-drag zoom, Alt+Middle-drag pan, Alt+dbl-click reset
+        self._zooming = False
+        self._panning = False
+        self._zoom_y0 = 0.0
+        self._zoom_start = 1.0
+        self._pan_pos = QPointF(0.0, 0.0)
+        self._pan_start = QPointF(0.0, 0.0)
+        self._gesture_btn: Qt.MouseButton | None = None
+        self._gesture_moved = False
+        self._alt_tap_last_t = 0.0
+        self._alt_tap_last_pos = QPointF(0.0, 0.0)
+        self._alt_tap_last_btn: Qt.MouseButton | None = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self._label = QLabel(self)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setStyleSheet("background:#0f0f12;")
+        self._label.setMouseTracking(True)
+        lay.addWidget(self._label)
+
+        # --- exit button (top-right, hover) ---------------------------------
+        self._btn = QPushButton(self)
+        self._btn.setFixedSize(28, 28)
+        self._btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn.setIcon(make_tool_icon("pip", True))
+        self._btn.setIconSize(QSize(18, 18))
+        self._btn.setToolTip("Exit PiP — back to InkIt")
+        self._btn.setStyleSheet(
+            "QPushButton { background:#2a2a30; border:1px solid #3a3a42; border-radius:14px; }"
+            " QPushButton:hover { background:#3d5afe; border-color:#3d5afe; }"
+        )
+        self._btn.clicked.connect(self._exit)
+
+        # --- floating pen button (right edge below exit) ---------------------
+        self._pen_btn = QPushButton(self)
+        self._pen_btn.setFixedSize(28, 28)
+        self._pen_btn.setCheckable(True)
+        self._pen_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._pen_btn.setIcon(self._pen_icon())
+        self._pen_btn.setIconSize(QSize(16, 16))
+        self._pen_btn.setToolTip("Pen — draw notes straight onto the PiP video")
+        self._pen_btn.setStyleSheet(
+            "QPushButton { background:#2a2a30; border:1px solid #3a3a42; border-radius:14px; }"
+            " QPushButton:hover { background:#35353c; }"
+            " QPushButton:checked { background:#3d5afe; border-color:#3d5afe; }"
+        )
+        self._pen_btn.toggled.connect(self._set_draw_mode)
+
+        # --- timeline bar (bottom, always visible): slider + frame readout ---
+        self._bar = QWidget(self)
+        self._bar.setObjectName("pipBar")
+        self._bar.setStyleSheet(
+            "#pipBar { background:#e6111114; border-radius:6px; }"
+            " QLabel { color:#eeeeee; font-size:11px; background:transparent; }"
+        )
+        bl = QHBoxLayout(self._bar)
+        bl.setContentsMargins(10, 4, 10, 4)
+        bl.setSpacing(8)
+        self.slider = TimelineSlider(Qt.Orientation.Horizontal)
+        self.slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.slider.setToolTip("Scrub timeline")
+        self.slider.valueChanged.connect(self._scrub_to)
+        self.lbl_time = QLabel("—")
+        self.lbl_time.setMinimumWidth(96)
+        self.lbl_time.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(self.slider, 1)
+        bl.addWidget(self.lbl_time)
+
+        self._grip = QSizeGrip(self)
+        self._grip.setFixedSize(16, 16)
+        self._grip.raise_()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._update_frame)
+        self._timer.setInterval(33)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._install_shortcuts()
+
+    # -- helpers -----------------------------------------------------------
+
+    def _install_shortcuts(self) -> None:
+        """Replicates every main-window action (incl. user-customized keys) as
+        widget-scope shortcuts so full app navigation works inside PiP."""
+        try:
+            acts = dict(getattr(self.main_win, "_actions", {}) or {})
+        except Exception:
+            acts = {}
+        for key, act in acts.items():
+            try:
+                seq = act.shortcut()
+                if seq.isEmpty():
+                    continue
+                sc = QShortcut(seq, self)
+                sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                sc.activated.connect(act.trigger)
+            except Exception:
+                continue
+
+    def _pen_icon(self) -> QIcon:
+        f = ICONS_DIR / "pen.png"
+        if f.is_file():
+            return QIcon(str(f))
+        pm = QPixmap(64, 64)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor("#e8eaf0"), 5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPointF(18, 46), QPointF(44, 20))
+        p.drawLine(QPointF(44, 20), QPointF(50, 26))
+        p.drawLine(QPointF(50, 26), QPointF(24, 52))
+        p.setBrush(QColor("#ffcc00"))
+        p.setPen(Qt.PenStyle.NoPen)
+        pts = QPolygonF([QPointF(18, 46), QPointF(24, 52), QPointF(14, 56)])
+        p.drawPolygon(pts)
+        p.end()
+        return QIcon(pm)
+
+    def _exit(self):
+        self._set_draw_mode(False)
+        if self.main_win and hasattr(self.main_win, "btn_pip"):
+            self.main_win.btn_pip.setChecked(False)
+        self.hide()
+        if self.main_win:
+            self.main_win.show()
+            self.main_win.raise_()
+            self.main_win.activateWindow()
+
+    def _set_draw_mode(self, on: bool) -> None:
+        self._draw_mode = bool(on)
+        self._pen_btn.blockSignals(True)
+        self._pen_btn.setChecked(self._draw_mode)
+        self._pen_btn.blockSignals(False)
+        self._finish_stroke(cancel=True)
+        if self._draw_mode:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._pen_btn.show()
+            try:
+                self.main_win.statusBar().showMessage(
+                    "PiP pen ON — draw on the mini player · Right-drag erases · Toggle off to move the window",
+                    4000,
+                )
+            except Exception:
+                pass
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            if not self.underMouse():
+                self._pen_btn.hide()
+
+    def _media_size(self) -> tuple[int, int]:
+        mw = self.main_win
+        img = getattr(mw.canvas, "image", None)
+        if img is not None and not img.isNull():
+            return img.width(), img.height()
+        return int(mw.project.width or 16), int(mw.project.height or 9)
+
+    def _update_content_rect(self) -> QRectF:
+        """Letterboxed video area inside this window (zoom=1 mapping like Canvas)."""
+        iw, ih = self._media_size()
+        wr = self.rect()
+        scale = min(wr.width() / max(iw, 1), wr.height() / max(ih, 1))
+        w, h = iw * scale, ih * scale
+        x = wr.x() + (wr.width() - w) / 2
+        y = wr.y() + (wr.height() - h) / 2
+        new = QRectF(x, y, w, h)
+        if new != self._dst:
+            self._dst = new
+            self._video_key = None
+            self._ink_key = None
+            self._ink = None
+            self._active = None
+            self._n_rend = 0
+        return self._dst
+
+    def _to_norm(self, pos: QPointF) -> QPointF | None:
+        r = self._dst
+        if r.isEmpty():
+            return None
+        nx = min(max((pos.x() - r.x()) / r.width(), 0.0), 1.0)
+        ny = min(max((pos.y() - r.y()) / r.height(), 0.0), 1.0)
+        return QPointF(nx, ny)
+
+    def _layer_size(self) -> QSize:
+        return QSize(max(2, int(round(self._dst.width()))), max(2, int(round(self._dst.height()))))
+
+    # -- navigation ---------------------------------------------------------
+
+    def _begin_scrub(self, x: float) -> None:
+        """Middle-drag timeline scrubbing, same idea as the main canvas."""
+        self._finish_stroke(cancel=True)
+        self._scrub_x = float(x)
+        try:
+            self._scrub_frame = int(self.main_win.canvas.current_frame)
+        except Exception:
+            self._scrub_frame = 0
+
+    def _move_scrub(self, x: float) -> None:
+        if self._scrub_x is None:
+            return
+        mw = self.main_win
+        n = max(int(mw.project.frame_count) - 1, 0)
+        target = int(self._scrub_frame + round((float(x) - self._scrub_x) / 4.0))
+        self._scrub_to(min(max(target, 0), n))
+
+    def _end_scrub(self) -> None:
+        self._scrub_x = None
+
+    # -- view navigation (Alt gestures — mirror the main canvas) ----------
+
+    def _cv(self):
+        return self.main_win.canvas
+
+    def _fit_in_widget(self) -> QRectF:
+        """Letterboxed video rect in THIS widget, with the shared zoom/pan
+        applied exactly like Canvas._fit (zoom scales about the widget center,
+        pan shifts that center)."""
+        iw, ih = self._media_size()
+        wr = self.rect()
+        scale = min(wr.width() / max(iw, 1), wr.height() / max(ih, 1))
+        w, h = iw * scale, ih * scale
+        x = wr.x() + (wr.width() - w) / 2
+        y = wr.y() + (wr.height() - h) / 2
+        cv = self._cv()
+        z, pan = float(cv._zoom), getattr(cv, "_pan", QPointF(0.0, 0.0))
+        if z != 1.0 or not pan.isNull():
+            c = QPointF(wr.center().x() + pan.x(), wr.center().y() + pan.y())
+            w *= z
+            h *= z
+            x = c.x() - w / 2.0
+            y = c.y() - h / 2.0
+        return QRectF(x, y, w, h)
+
+    def _reset_view(self) -> None:
+        self._zooming = False
+        self._panning = False
+        self._gesture_btn = None
+        self._gesture_moved = False
+        cv = self._cv()
+        cv._zoom = 1.0
+        cv._pan = QPointF(0.0, 0.0)
+        self._reset_view_cursor()
+        self._present()
+
+    def _reset_zoom(self) -> None:
+        self._zooming = False
+        self._gesture_moved = False
+        self._cv()._zoom = 1.0
+        self._reset_view_cursor()
+        self._present()
+
+    def _reset_pan(self) -> None:
+        self._panning = False
+        self._gesture_moved = False
+        self._cv()._pan = QPointF(0.0, 0.0)
+        self._reset_view_cursor()
+        self._present()
+
+    def _reset_view_cursor(self) -> None:
+        self.setCursor(Qt.CursorShape.CrossCursor if self._draw_mode else Qt.CursorShape.ArrowCursor)
+
+    def _begin_zoom(self, y: float, btn: Qt.MouseButton) -> None:
+        cv = self._cv()
+        self._zooming = True
+        self._gesture_btn = btn
+        self._gesture_moved = False
+        self._zoom_y0 = y
+        self._zoom_start = float(cv._zoom)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+
+    def _move_zoom(self, y: float) -> None:
+        cv = self._cv()
+        dy = y - self._zoom_y0
+        if abs(dy) > 6.0:
+            self._gesture_moved = True
+        factor = 1.0 - dy * 0.005  # drag up = zoom in, down = zoom out
+        cv._zoom = min(8.0, max(0.25, self._zoom_start * factor))
+        self._present(fast=True)
+
+    def _end_zoom(self) -> None:
+        self._zooming = False
+        self._gesture_btn = None
+        self._reset_view_cursor()
+
+    def _begin_pan(self, pos: QPointF, btn: Qt.MouseButton) -> None:
+        cv = self._cv()
+        self._panning = True
+        self._gesture_btn = btn
+        self._gesture_moved = False
+        self._pan_pos = QPointF(pos)
+        self._pan_start = QPointF(cv._pan)
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _move_pan(self, pos: QPointF) -> None:
+        cv = self._cv()
+        if (pos - self._pan_pos).manhattanLength() > 8.0:
+            self._gesture_moved = True
+        d = pos - self._pan_pos
+        cv._pan = QPointF(self._pan_start.x() + d.x(), self._pan_start.y() + d.y())
+        self._present(fast=True)
+
+    def _end_pan(self) -> None:
+        self._panning = False
+        self._gesture_btn = None
+        self._reset_view_cursor()
+
+    def _sync_tool_ui(self) -> None:
+        """Reflects pen/eraser tool changes (B/E shortcuts) in PiP."""
+        try:
+            tool = self.main_win.canvas.tool
+        except Exception:
+            return
+        if tool == self._last_tool:
+            return
+        self._last_tool = tool
+        if tool == "eraser":
+            self._pen_btn.setStyleSheet(
+                "QPushButton { background:#2a2a30; border:1px solid #3a3a42; border-radius:14px; }"
+                " QPushButton:hover { background:#35353c; }"
+                " QPushButton:checked { background:#ff9f43; border-color:#ff9f43; }"
+            )
+            hint = "Eraser active in PiP (E) — B switches back to pen · Right/barrel-top drags erase too"
+        else:
+            self._pen_btn.setStyleSheet(
+                "QPushButton { background:#2a2a30; border:1px solid #3a3a42; border-radius:14px; }"
+                " QPushButton:hover { background:#35353c; }"
+                " QPushButton:checked { background:#3d5afe; border-color:#3d5afe; }"
+            )
+            hint = "Pen active in PiP (B)"
+        try:
+            self.main_win.statusBar().showMessage(hint, 2500)
+        except Exception:
+            pass
+
+    def _scrub_to(self, v: int) -> None:
+        mw = self.main_win
+        if getattr(mw, "_maya_sync_guard", False):
+            return
+        try:
+            mw.slider.setValue(int(v))
+        except Exception:
+            pass
+
+    def wheelEvent(self, ev) -> None:
+        if self._stroke is not None:
+            ev.accept()
+            return
+        d = ev.angleDelta().y()
+        if d:
+            self.main_win._step(1 if d > 0 else -1)
+            ev.accept()
+            return
+        super().wheelEvent(ev)
+
+    def keyPressEvent(self, ev) -> None:
+        if ev.key() == Qt.Key.Key_Escape:
+            if self._draw_mode:
+                self._set_draw_mode(False)
+            else:
+                self._exit()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+    # -- drawing ------------------------------------------------------------
+
+    def _begin_stroke(self, pos: QPointF, pressure: float, eraser: bool) -> None:
+        if self._stroke is not None:
+            return
+        mw = self.main_win
+        n = self._to_norm(pos)
+        if n is None:
+            return
+        cv = mw.canvas
+        self._stroke = Stroke(
+            color=cv.color.name(QColor.NameFormat.HexRgb),
+            base_width=cv._draw_width(),
+            eraser=bool(eraser),
+            opacity=float(getattr(cv, "pen_opacity", 1.0)),
+            hardness=float(getattr(cv, "hardness", 1.0)),
+            points=[Point(n.x(), n.y(), pressure)],
+        )
+        mw.project.strokes_at(int(cv.current_frame)).append(self._stroke)
+        self._active = None
+        self._n_rend = 0
+
+    def _move_stroke(self, pos: QPointF, pressure: float) -> None:
+        s = self._stroke
+        if s is None:
+            return
+        n = self._to_norm(pos)
+        if n is None:
+            return
+        last = s.points[-1]
+        dx, dy = n.x() - last.x, n.y() - last.y
+        if (dx * dx + dy * dy) < 1e-8:
+            return
+        s.points.append(Point(n.x(), n.y(), pressure))
+
+    def _finish_stroke(self, cancel: bool = False) -> None:
+        s = self._stroke
+        self._stroke = None
+        self._temp_eraser = False
+        self._active = None
+        self._n_rend = 0
+        # force a clean rebuild so pen strokes AND eraser cuts are baked in
+        self._ink = None
+        self._ink_key = None
+        if s is None or cancel:
+            return
+        mw = self.main_win
+        try:
+            mw.canvas.update()
+            mw._refresh_marks()
+            mw._autosave_timer.start(250)
+        except Exception:
+            pass
+
+    def _ensure_ink(self) -> None:
+        """Committed-stroke layer for the current frame (rebuilt on change)."""
+        mw = self.main_win
+        cv = mw.canvas
+        f = int(cv.current_frame)
+        ls = self._layer_size()
+        strokes = list(mw.project.strokes_at(f))
+        if self._stroke is not None and strokes and strokes[-1] is self._stroke:
+            strokes = strokes[:-1]
+        aa = bool(getattr(cv, "antialias", True))
+        total_pts = sum(len(s.points) for s in strokes)
+        key = (id(mw.project), f, ls.width(), ls.height(), aa, len(strokes), total_pts)
+        if self._ink is not None and self._ink.size() == ls and key == self._ink_key:
+            return
+        img = QImage(ls, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, aa)
+        shim = _PipPaintShim(QRectF(0, 0, ls.width(), ls.height()), self._media_size()[0], self._media_size()[1])
+        r = QRectF(0, 0, ls.width(), ls.height())
+        try:
+            for s in strokes:
+                Canvas._paint_stroke(shim, p, s, r)
+        except Exception:
+            pass
+        p.end()
+        self._ink = img
+        self._ink_key = key
+
+    def _ensure_active_layer(self) -> None:
+        """Paints only newly added points of the in-progress stroke."""
+        s = self._stroke
+        if s is None:
+            return
+        ls = self._layer_size()
+        if self._active is None or self._active.size() != ls:
+            img = QImage(ls, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(Qt.GlobalColor.transparent)
+            self._active = img
+            self._n_rend = 0
+        pts = s.points
+        if self._n_rend >= len(pts):
+            return
+        cv = self.main_win.canvas
+        p = QPainter(self._active)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, bool(getattr(cv, "antialias", True)))
+        shim = _PipPaintShim(QRectF(0, 0, ls.width(), ls.height()), self._media_size()[0], self._media_size()[1])
+        r = QRectF(0, 0, ls.width(), ls.height())
+        try:
+            if s.eraser:
+                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+                Canvas._stroke_geometry(shim, p, s, r, QColor(0, 0, 0, 255), seg_from=self._n_rend)
+            elif float(getattr(s, "hardness", 1.0)) < 0.995:
+                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Lighten)
+                Canvas._soft_stroke(shim, p, s, r, QColor(s.color), seg_from=self._n_rend)
+            else:
+                col = QColor(s.color)
+                col.setAlpha(255)
+                Canvas._stroke_geometry(shim, p, s, r, col, seg_from=self._n_rend)
+        except Exception:
+            pass
+        p.end()
+        self._n_rend = len(pts)
+
+    # -- presentation ---------------------------------------------------------
+
+    def _video_image(self) -> QImage | None:
+        mw = self.main_win
+        f = int(mw.canvas.current_frame)
+        ls = self._layer_size()
+        key = (f, ls.width(), ls.height())
+        if self._video_img is not None and self._video_key == key:
+            return self._video_img
+        bgr = self._current_bgr()
+        img = None
+        if bgr is not None:
+            try:
+                resized = cv2.resize(bgr, (ls.width(), ls.height()), interpolation=cv2.INTER_AREA)
+                img = bgr_to_qimage(resized)
+            except Exception:
+                img = None
+        if img is None:
+            # no decoded media (e.g. empty state) — flat base keeps the layered
+            # renderer (and live drawing feedback) fully functional
+            img = QImage(ls, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(QColor("#0f0f12"))
+        self._video_img = img
+        self._video_key = key
+        return self._video_img
+
+    def _current_ink_for_display(self) -> QImage | None:
+        """Committed ink with the in-progress stroke applied.
+
+        Eraser strokes cut holes into a COPY of the committed layer (same
+        technique as Canvas.paintEvent) so erasing shows up in real time.
+        """
+        self._ensure_ink()
+        if self._ink is None:
+            return None
+        s = self._stroke
+        if s is None or not s.eraser:
+            return self._ink
+        combined = QImage(self._ink)
+        ls = self._layer_size()
+        cp = QPainter(combined)
+        cp.setRenderHint(QPainter.RenderHint.Antialiasing, bool(getattr(self.main_win.canvas, "antialias", True)))
+        cp.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        shim = _PipPaintShim(QRectF(0, 0, ls.width(), ls.height()), self._media_size()[0], self._media_size()[1])
+        try:
+            Canvas._stroke_geometry(shim, cp, s, QRectF(0, 0, ls.width(), ls.height()), QColor(0, 0, 0, 255))
+        except Exception:
+            pass
+        cp.end()
+        return combined
+
+    def _build_display(self) -> QPixmap | None:
+        mw = self.main_win
+        cv = mw.canvas
+        video = self._video_image()
+        if video is None:
+            return None
+        pm = QPixmap.fromImage(video)
+        p = QPainter(pm)
+        try:
+            if bool(getattr(cv, "notes_visible", True)):
+                ink = self._current_ink_for_display()
+                op = float(min(max(float(getattr(cv, "notes_opacity", 1.0)), 0.0), 1.0))
+                if ink is not None and self._stroke is not None and not self._stroke.eraser:
+                    # pen: committed ink at notes opacity, live stroke at its own opacity
+                    p.setOpacity(op)
+                    p.drawImage(0, 0, ink)
+                    self._ensure_active_layer()
+                    if self._active is not None:
+                        sop = float(min(max(float(self._stroke.opacity), 0.0), 1.0))
+                        p.setOpacity(op * sop)
+                        p.drawImage(0, 0, self._active)
+                elif ink is not None:
+                    p.setOpacity(op)
+                    p.drawImage(0, 0, ink)
+        finally:
+            p.end()
+        return pm
+
+    def _draw_hud(self, p: QPainter, w: int, h: int) -> None:
+        """Frame counter badge on the PiP video — always visible, top-right but
+        offset left of the floating exit/pen buttons (at w-34) so it never sits
+        behind them."""
+        cv = self.main_win.canvas
+        if not cv.frame_overlay_text:
+            return
+        f = p.font()
+        f.setBold(True)
+        f.setPointSize(max(11, int(h / 40)))
+        p.setFont(f)
+        text = cv.frame_overlay_text
+        metrics = p.fontMetrics()
+        pad = 10
+        tw = metrics.horizontalAdvance(text) + pad * 2
+        th = metrics.height() + pad
+        # 34 = button x-offset from right, 10 = gap to button
+        box = QRectF(w - tw - 44, pad, tw, th)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 140))
+        p.drawRoundedRect(box, 4, 4)
+        p.setPen(QColor("#eeeeee"))
+        p.drawText(box, int(Qt.AlignmentFlag.AlignCenter), text)
+
+    def _present(self, fast: bool = False) -> None:
+        pm = self._build_display()
+        if pm is None or pm.isNull():
+            try:
+                pm = self.main_win.canvas.grab()
+                if pm.isNull():
+                    return
+            except Exception:
+                return
+        out = QPixmap(self._label.size())
+        out.fill(QColor("#0f0f12"))
+        p = QPainter(out)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, not fast)
+        p.drawPixmap(self._fit_in_widget(), pm, pm.rect())
+        self._draw_hud(p, out.width(), out.height())
+        p.end()
+        self._label.setPixmap(out)
+
+    def _update_frame(self):
+        mw = self.main_win
+        if not mw or not mw.canvas:
+            return
+        if self._stroke is not None:
+            return  # mid-stroke: mouse/tablet handlers drive presentation
+        self._update_content_rect()
+        self._sync_tool_ui()
+        f = int(mw.canvas.current_frame)
+        if f != self._last_frame:
+            self._last_frame = f
+            if self._draw_mode and self._stroke is None and mw.playing:
+                pass  # frames advance under the pen — ink layer follows
+        n = max(int(mw.project.frame_count) - 1, 0)
+        self.slider.blockSignals(True)
+        self.slider.setMaximum(n)
+        self.slider.setValue(min(max(f, 0), n))
+        self.slider.blockSignals(False)
+        self.lbl_time.setText(mw.lbl_time.text())
+        self._marks_tick += 1
+        if self._marks_tick % 15 == 0:
+            self.slider.set_marks(mw.project.annotated_frames())
+        self._present()
+
+    # -- events ---------------------------------------------------------------
+
+    def enterEvent(self, ev):
+        self._mouse_inside = True
+        self._btn.show()
+        self._btn.raise_()
+        self._pen_btn.show()
+        self._pen_btn.raise_()
+        self._bar.show()
+        self._bar.raise_()
+        super().enterEvent(ev)
+
+    def leaveEvent(self, ev):
+        self._mouse_inside = False
+        self._btn.hide()
+        self._bar.hide()
+        if not self._draw_mode:
+            self._pen_btn.hide()
+        super().leaveEvent(ev)
+
+    def resizeEvent(self, ev):
+        self._btn.move(self.width() - 34, 6)
+        self._pen_btn.move(self.width() - 34, 40)
+        self._bar.move(8, self.height() - 40)
+        self._bar.resize(self.width() - 16, 32)
+        if self._mouse_inside:
+            self._bar.show()
+        self._bar.raise_()
+        if hasattr(self, "_grip"):
+            self._grip.move(self.width() - 16, self.height() - 16)
+            self._grip.raise_()
+        self._video_key = None
+        self._ink_key = None
+        self._ink = None
+        self._active = None
+        self._n_rend = 0
+        super().resizeEvent(ev)
+        self._update_content_rect()
+        self._present(fast=True)
+
+    def mousePressEvent(self, ev):
+        self.setFocus()
+        self.activateWindow()
+        pos = ev.position()
+        if self._stroke is not None:
+            ev.accept()
+            return
+        alt = bool(ev.modifiers() & Qt.KeyboardModifier.AltModifier)
+        if alt and ev.button() == Qt.MouseButton.RightButton:
+            self._begin_zoom(pos.y(), Qt.MouseButton.RightButton)
+            ev.accept()
+            return
+        if alt and ev.button() == Qt.MouseButton.MiddleButton:
+            self._begin_pan(pos, Qt.MouseButton.MiddleButton)
+            ev.accept()
+            return
+        if ev.button() == Qt.MouseButton.MiddleButton:
+            # middle-drag scrubs the timeline (works in and out of pen mode)
+            self._begin_scrub(pos.x())
+            ev.accept()
+            return
+        if self._draw_mode and self._dst.contains(pos):
+            if alt:
+                # Alt reserves the left button for the reset double-click
+                ev.accept()
+                return
+            eraser_input = False
+            try:
+                pd = ev.pointingDevice()
+                eraser_input = pd is not None and pd.pointerType() == QPointingDevice.PointerType.Eraser
+            except Exception:
+                pass
+            eraser = eraser_input or (ev.button() == Qt.MouseButton.RightButton) or self.main_win.canvas.tool == "eraser"
+            self._temp_eraser = eraser_input or ev.button() == Qt.MouseButton.RightButton
+            self._begin_stroke(pos, 0.75, eraser)
+            ev.accept()
+            return
+        if ev.button() == Qt.MouseButton.LeftButton and not alt:
+            self._drag_pos = ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._zooming:
+            self._move_zoom(ev.position().y())
+            ev.accept()
+            return
+        if self._panning:
+            self._move_pan(ev.position())
+            ev.accept()
+            return
+        if self._stroke is not None:
+            self._move_stroke(ev.position(), 0.75)
+            self._present(fast=True)
+            ev.accept()
+            return
+        if self._scrub_x is not None:
+            self._move_scrub(ev.position().x())
+            ev.accept()
+            return
+        if self._drag_pos is not None and ev.buttons() & Qt.MouseButton.LeftButton:
+            self.move(ev.globalPosition().toPoint() - self._drag_pos)
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if self._zooming and ev.button() == self._gesture_btn:
+            self._end_zoom()
+            ev.accept()
+            return
+        if self._panning and ev.button() == self._gesture_btn:
+            self._end_pan()
+            ev.accept()
+            return
+        if self._stroke is not None:
+            self._finish_stroke()
+            self._present()
+            ev.accept()
+            return
+        if ev.button() == Qt.MouseButton.MiddleButton and self._scrub_x is not None:
+            self._end_scrub()
+            ev.accept()
+            return
+        self._drag_pos = None
+        super().mouseReleaseEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev) -> None:
+        """Alt+dbl-click resets the view: right=zoom, middle=pan, left=both."""
+        btn = ev.button()
+        alt = bool(ev.modifiers() & Qt.KeyboardModifier.AltModifier)
+        if alt and not self._gesture_moved:
+            if btn == Qt.MouseButton.RightButton:
+                self._reset_zoom()
+                ev.accept()
+                return
+            if btn == Qt.MouseButton.MiddleButton:
+                self._reset_pan()
+                ev.accept()
+                return
+            if btn == Qt.MouseButton.LeftButton:
+                self._reset_view()
+                ev.accept()
+                return
+        ev.ignore()
+
+    def tabletEvent(self, ev):
+        t = ev.type()
+        pos = ev.position()
+        pressure = float(ev.pressure()) if float(ev.pressure()) > 0 else 0.75
+        btn = ev.button()
+        btns = ev.buttons()
+        mid_btn = bool((btn | btns) & Qt.MouseButton.MiddleButton)
+        right_btn = bool((btn | btns) & Qt.MouseButton.RightButton)
+        alt = bool(ev.modifiers() & Qt.KeyboardModifier.AltModifier)
+        # QPointingDevice lives in QtGui (imported at module level) — do NOT
+        # re-import it from QtCore here; that ImportError silently disabled
+        # stylus-eraser detection.
+        eraser_dev = ev.pointerType() == QPointingDevice.PointerType.Eraser
+        if t == QEvent.Type.TabletPress:
+            if self._stroke is not None:
+                ev.accept()
+                return
+            # Alt + double left-tap (pen nib) resets the view — timed manually
+            # since tablet events carry no DblClick type.
+            now = time.monotonic()
+            quick = (
+                alt
+                and btn == Qt.MouseButton.LeftButton
+                and btn == self._alt_tap_last_btn
+                and (now - self._alt_tap_last_t) * 1000.0 <= QApplication.doubleClickInterval()
+                and (pos - self._alt_tap_last_pos).manhattanLength() < 8.0
+            )
+            self._alt_tap_last_btn = btn if alt else None
+            self._alt_tap_last_t = now if (alt and btn != Qt.MouseButton.NoButton) else 0.0
+            self._alt_tap_last_pos = QPointF(pos)
+            if quick:
+                self._reset_view()
+                ev.accept()
+                return
+            if alt:
+                if right_btn:
+                    self._begin_zoom(pos.y(), Qt.MouseButton.RightButton)
+                elif mid_btn:
+                    self._begin_pan(pos, Qt.MouseButton.MiddleButton)
+                ev.accept()
+                return
+            if mid_btn:
+                # barrel-middle scrubs, never draws
+                self._begin_scrub(pos.x())
+                ev.accept()
+                return
+            if self._draw_mode and self._dst.contains(pos):
+                eraser = eraser_dev or right_btn or self.main_win.canvas.tool == "eraser"
+                self._temp_eraser = eraser_dev or right_btn
+                self._begin_stroke(pos, pressure, eraser)
+                ev.accept()
+                return
+        if self._zooming and t == QEvent.Type.TabletMove:
+            self._move_zoom(pos.y())
+            ev.accept()
+            return
+        if self._panning and t == QEvent.Type.TabletMove:
+            self._move_pan(pos)
+            ev.accept()
+            return
+        if (self._zooming or self._panning) and t == QEvent.Type.TabletRelease and btn == self._gesture_btn:
+            if self._zooming:
+                self._end_zoom()
+            else:
+                self._end_pan()
+            ev.accept()
+            return
+        if self._scrub_x is not None:
+            if t == QEvent.Type.TabletMove:
+                self._move_scrub(pos.x())
+            elif t == QEvent.Type.TabletRelease and not mid_btn:
+                self._end_scrub()
+            ev.accept()
+            return
+        if self._stroke is not None:
+            if t == QEvent.Type.TabletMove:
+                self._move_stroke(pos, pressure)
+                self._present(fast=True)
+            elif t == QEvent.Type.TabletRelease:
+                self._finish_stroke()
+                self._present()
+            ev.accept()
+            return
+        super().tabletEvent(ev)
+
+    def showEvent(self, ev):
+        self._timer.start()
+        self._video_key = None
+        self._ink_key = None
+        self._ink = None
+        self._active = None
+        self._n_rend = 0
+        self._update_content_rect()
+        self._update_frame()
+        # safety: some WM paths restore the main window when focus moves —
+        # make sure it stays hidden while PiP is up
+        QTimer.singleShot(0, self._keep_main_hidden)
+        QTimer.singleShot(150, self._keep_main_hidden)
+        super().showEvent(ev)
+
+    def hideEvent(self, ev):
+        self._timer.stop()
+        self._finish_stroke(cancel=True)
+        super().hideEvent(ev)
+
+    def _keep_main_hidden(self) -> None:
+        mw = self.main_win
+        if mw is not None and hasattr(mw, "btn_pip") and mw.btn_pip.isChecked() and mw.isVisible():
+            mw.hide()
+
+    # -- frame source -------------------------------------------------------
+
+    def _current_bgr(self) -> np.ndarray | None:
+        mw = self.main_win
+        try:
+            if getattr(mw, "_is_still", False):
+                return getattr(mw, "_still_bgr", None)
+            if mw.reader.cap is not None:
+                return mw.reader.frame(int(mw.canvas.current_frame))
+        except Exception:
+            return None
+        return None
+
+
 class MainWindow(QMainWindow):
     """
     Main application window containing:
@@ -3950,6 +4952,18 @@ class MainWindow(QMainWindow):
         self._vol_drag_x = None             # Volume drag state (audio button)
         self._vol_drag_start = 0
         self._vol_dragged = False
+        # Maya live sync (scrub Maya <-> scrub InkIt) — per-shot offset support
+        self._maya_server = None
+        self._maya_offset = int(self._settings.get("maya_offset", 10045))
+        self._maya_offsets: dict[str, int] = dict(self._settings.get("maya_offsets", {}) or {})
+        self._maya_port = int(self._settings.get("maya_port", 6005))
+        self._maya_send_port = int(self._settings.get("maya_send_port", 6006))
+        self._maya_sync_guard = False
+        self._maya_pending_frame = None
+        self._maya_sync_timer = QTimer(self)
+        self._maya_sync_timer.setInterval(16)
+        self._maya_sync_timer.timeout.connect(self._process_maya_pending)
+        self._maya_send_fail_until = 0.0
 
         # Canvas Setup
         self.canvas = Canvas(self.project)
@@ -3997,6 +5011,16 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Middle-drag or scroll wheel to change frames."
         )
+# Sync indicator — green only when Maya-side maya_inkit_sync.py reports a
+        # live connection. Clicking never starts sync from the app (Maya is the
+        # only side that syncs); it checks the InkIt shelf button exists in Maya
+        # and installs it onto the shelf if it's missing.
+        self._maya_status = QLabel()
+        self._maya_status.setStyleSheet("padding: 2px 8px; border-radius: 3px; font-weight: 600;")
+        self._maya_status.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._maya_status.mousePressEvent = lambda e: self._on_maya_status_clicked()
+        self.statusBar().addPermanentWidget(self._maya_status)
+        self._update_maya_status_indicator()
         geo = self._settings.get("win_geometry") or ""
         if geo:
             self.restoreGeometry(QByteArray.fromBase64(geo.encode("ascii")))
@@ -4006,6 +5030,11 @@ class MainWindow(QMainWindow):
         # sees events from widgets still under construction.
         QApplication.instance().installEventFilter(self)
         self._cleanup_autosaves()  # purge autosaves older than the configured age
+        # Maya sync intentionally starts OFF every launch — no auto-start here.
+        # The app only *listens*; sync is initiated from the Maya side when
+        # maya_inkit_sync.py runs there. Listening lets the indicator turn
+        # green when Maya connects (SYNC 1). Silent: no toolbar message.
+        self._start_maya_server(silent=True)
 
     # -----------------------------------------------------------------------
     # Helper Widget Builders
@@ -4125,6 +5154,7 @@ class MainWindow(QMainWindow):
         wrap = QWidget()
         wrap.setLayout(bar)
         wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._top_wrap = wrap
 
         def restyle_wrap() -> None:
             c = self._colors()
@@ -4257,6 +5287,15 @@ class MainWindow(QMainWindow):
         clay.addWidget(self.spin_onion_next)
         bar.addWidget(cluster)
         bar.addWidget(self._tool_group(self.btn_view))
+        # --- [BUTTON] PiP — always on top, no controllers ---
+        self.btn_pip = QPushButton()
+        self.btn_pip.setFixedSize(34, 32)
+        self.btn_pip.setIcon(make_tool_icon("pip", True))
+        self.btn_pip.setIconSize(QSize(18, 18))
+        self.btn_pip.setCheckable(True)
+        self.btn_pip.setToolTip("Picture-in-Picture — video only, always on top")
+        self.btn_pip.toggled.connect(self._toggle_pip)
+        bar.addWidget(self.btn_pip)
 
         layout.addWidget(wrap)
 
@@ -4270,6 +5309,7 @@ class MainWindow(QMainWindow):
         play_wrap.setLayout(play)
         play_wrap.setStyleSheet(wrap.styleSheet())
         play_wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._play_wrap = play_wrap
 
         # --- [BUTTON] Previous Drawing (|<) ---
         self.btn_prev_draw = QPushButton()
@@ -4454,6 +5494,10 @@ class MainWindow(QMainWindow):
         self._act("brush_smaller", self._brush_smaller)
         self._act("brush_larger", self._brush_larger)
         self._act("pick_color", self._pick_screen_color)
+        self._act("pen_color_1", lambda: self._apply_pen_color_slot(0))
+        self._act("pen_color_2", lambda: self._apply_pen_color_slot(1))
+        self._act("pen_color_3", lambda: self._apply_pen_color_slot(2))
+        self._act("pen_color_4", lambda: self._apply_pen_color_slot(3))
         self._act("toggle_loop", self._toggle_loop)
         # -- commands that previously had no shortcut (see SHORTCUTS registry) --
         self._act("time_mode", self._toggle_time_mode)
@@ -4481,10 +5525,53 @@ class MainWindow(QMainWindow):
 
     def _toggle_always_on_top(self, on: bool) -> None:
         """Keeps the InkIt window above all other windows."""
+        # PiP has its own always-on-top handling — don't fight it
+        if getattr(self, "btn_pip", None) and self.btn_pip.isChecked():
+            return
         self._settings["always_on_top"] = bool(on)
         self._schedule_save()
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(on))
         self.show()
+
+    def resizeEvent(self, ev):
+        # Live-resize: keep repainting fast (canvas reuses its last stroke
+        # render) and only rebuild the accurate cache once the resize settles.
+        try:
+            self.canvas._resize_suppress = True
+        except Exception:
+            pass
+        if not hasattr(self, "_resize_timer") or self._resize_timer is None:
+            self._resize_timer = QTimer(self)
+            self._resize_timer.setSingleShot(True)
+            self._resize_timer.timeout.connect(self._resize_settled)
+        self._resize_timer.start(150)
+        super().resizeEvent(ev)
+
+    def _resize_settled(self) -> None:
+        try:
+            self.canvas._resize_suppress = False
+            self.canvas.update()
+        except Exception:
+            pass
+
+    def _toggle_pip(self, on: bool) -> None:
+        is_pip = bool(on)
+        if is_pip:
+            if not hasattr(self, "_pip_win") or self._pip_win is None:
+                self._pip_win = PipWindow(self)
+            self.hide()
+            self._pip_win.show()
+            self._pip_win.raise_()
+            self._pip_win.activateWindow()
+        else:
+            if hasattr(self, "_pip_win") and self._pip_win is not None:
+                self._pip_win._set_draw_mode(False)
+                self._pip_win.hide()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(self._settings.get("always_on_top", False)))
+            self.show()
 
     def _set_tool(self, name: str) -> None:
         self.canvas.tool = name
@@ -4614,6 +5701,16 @@ class MainWindow(QMainWindow):
                 pass
             sw.clicked.connect(lambda _=False, cc=col: self._apply_color(QColor(cc)))
 
+    def _apply_pen_color_slot(self, idx: int) -> None:
+        """Number-key shortcut: switch the pen to one of the 4 fixed swatch slots."""
+        cols = [str(c) for c in (self._settings.get("swatch_colors") or [])][:4]
+        while len(cols) < len(SWATCH_COLORS_DEFAULT):
+            cols.append(SWATCH_COLORS_DEFAULT[len(cols)])
+        if idx < len(cols) and QColor(cols[idx]).isValid():
+            self._apply_color(QColor(cols[idx]))
+        else:
+            self._apply_color(QColor(SWATCH_COLORS_DEFAULT[idx]))
+
     def _assign_swatch_color(self, idx: int) -> None:
         """Double-click on a fixed slot: pick a color and store it in that slot."""
         cols = [str(c) for c in (self._settings.get("swatch_colors") or [])][:4]
@@ -4737,6 +5834,7 @@ class MainWindow(QMainWindow):
             fps_txt = f"{fps:.3f}".rstrip("0").rstrip(".")
             self.lbl_meta.setText(f"{w}×{h}   {fps_txt} fps")
         self.setWindowTitle(f"InkIt — {Path(path).name}")
+        self._load_maya_offset_for_path(path)
 
     def _notes_key(self, p: str) -> str:
         try:
@@ -5544,6 +6642,8 @@ class MainWindow(QMainWindow):
                 self.slider.setValue(index)
                 self.slider.blockSignals(False)
             self._update_time_label()
+            self._maybe_send_to_maya(index)
+            self._push_app_frame(index)
             return
         if self._is_still and self._still_bgr is not None:
             self.canvas.current_frame = 0
@@ -5553,6 +6653,8 @@ class MainWindow(QMainWindow):
                 self.slider.setValue(0)
                 self.slider.blockSignals(False)
             self._update_time_label()
+            self._maybe_send_to_maya(0)
+            self._push_app_frame(0)
             return
         if self.reader.cap is None:
             return
@@ -5568,8 +6670,10 @@ class MainWindow(QMainWindow):
             self.slider.setValue(index)
             self.slider.blockSignals(False)
         self._update_time_label()
-        if not self.playing:
+        if not self.playing and not getattr(self, "_maya_sync_guard", False):
             self._sync_audio()
+        self._maybe_send_to_maya(index)
+        self._push_app_frame(index)
 
 
     def _update_time_label(self) -> None:
@@ -5585,6 +6689,7 @@ class MainWindow(QMainWindow):
             self.canvas.frame_overlay_text = t
         if getattr(self.canvas, "frame_overlay", False):
             self.canvas.update()
+        self._update_maya_status_indicator()
 
     def _toggle_time_mode(self) -> None:
         self.time_mode = "time" if self.time_mode == "frames" else "frames"
@@ -5598,6 +6703,783 @@ class MainWindow(QMainWindow):
         self._update_time_label()
         self.canvas.update()
         self._schedule_save()
+
+    def _update_maya_status_indicator(self) -> None:
+        if not hasattr(self, "_maya_status"):
+            return
+        on = bool(self._settings.get("maya_sync", False))
+        if on:
+            self._maya_status.setText("● Sync")
+            self._maya_status.setStyleSheet("padding: 2px 10px; border-radius: 3px; font-weight: 600; background: #2ecc71; color: #111114;")
+            self._maya_status.setToolTip("Maya is connected — sync ON (initiated from Maya) · click to check/install the InkIt shelf button in Maya")
+        else:
+            self._maya_status.setText("○ Sync")
+            self._maya_status.setStyleSheet("padding: 2px 10px; border-radius: 3px; font-weight: 600; background: #3a3a42; color: #bbbbbb;")
+            self._maya_status.setToolTip("Waiting for Maya — run maya_inkit_sync.py in Maya to connect · click to check/install the InkIt shelf button in Maya")
+
+    # -- Maya live sync (per-shot offset) --------------------------------
+    def _send_maya_message(self, msg: str) -> bool:
+        try:
+            import socket
+            s = socket.socket()
+            s.settimeout(0.04)
+            s.connect(("127.0.0.1", int(self._maya_send_port)))
+            s.sendall((msg + "\n").encode())
+            s.close()
+            return True
+        except Exception:
+            return False
+
+    def _on_maya_status_clicked(self, ev=None) -> None:
+        """Clicking Sync deploys the script and puts the button on Maya's
+        currently selected shelf (Custom, My Animation, … — whatever is active)."""
+        wait = QProgressDialog("Checking Maya and installing InkIt Sync on current shelf…", None, 0, 0, self)
+        wait.setWindowTitle("InkIt Sync")
+        wait.setWindowModality(Qt.WindowModality.WindowModal)
+        wait.setMinimumDuration(0)
+        wait.setCancelButton(None)
+        wait.setAutoClose(False)
+        wait.setAutoReset(False)
+        wait.show()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            ok, detail = self._install_maya_on_current_shelf()
+        finally:
+            QApplication.restoreOverrideCursor()
+            wait.close()
+            wait.deleteLater()
+        self._update_maya_status_indicator()
+        self.statusBar().showMessage(detail, 6000)
+        if not ok:
+            QMessageBox.warning(self, "InkIt Sync", detail)
+
+    def _is_maya_shelf_installed(self) -> bool:
+        """True if the InkIt shelf button is present in the running Maya UI
+        (live query on current shelf). Falls back to a disk check when Maya can't be queried."""
+        live = self._live_maya_shelf_has_inkit(current_only=True)
+        if live is not None:
+            return live
+        return self._disk_maya_shelf_installed()
+
+    def _disk_maya_shelf_installed(self) -> bool:
+        """True if the InkIt shelf button exists in the shelf files of the
+        running Maya version (falls back to any installed version)."""
+        try:
+            import pathlib
+            maya_docs = pathlib.Path.home() / "Documents" / "maya"
+            if not maya_docs.is_dir():
+                return False
+            versions = self._maya_versions()
+            if not versions:
+                return False
+            runv = self._running_maya_version()
+            if runv:
+                running = [pp for pp in versions if pp.name == runv]
+                if running:
+                    versions = running
+            for ver in versions:
+                shelf_dir = ver / "prefs" / "shelves"
+                if not shelf_dir.is_dir():
+                    continue
+                for sf in shelf_dir.glob("shelf_*.mel"):
+                    try:
+                        if "maya_inkit_sync" in sf.read_text(encoding="utf-8", errors="ignore"):
+                            return True
+                    except Exception:
+                        pass
+            return False
+        except Exception:
+            return False
+
+    def _is_maya_running(self) -> bool:
+        try:
+            out = subprocess.check_output("tasklist", text=True, errors="ignore")
+            return "maya.exe" in out.lower()
+        except Exception:
+            return False
+
+    def _maya_versions(self) -> list:
+        """Installed Maya version dirs (e.g. .../maya/2026) under Documents/maya."""
+        try:
+            import pathlib
+            maya_docs = pathlib.Path.home() / "Documents" / "maya"
+            if not maya_docs.is_dir():
+                return []
+            return [pp for pp in maya_docs.iterdir() if pp.is_dir() and pp.name[0].isdigit()]
+        except Exception:
+            return []
+
+    def _running_maya_version(self):
+        """Returns the version (e.g. '2026') of the running maya.exe, or None."""
+        try:
+            kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if hasattr(subprocess, "CREATE_NO_WINDOW") else {}
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-Process maya -ErrorAction SilentlyContinue).Path"],
+                text=True, errors="ignore", **kwargs,
+            )
+        except Exception:
+            out = ""
+        for line in (out or "").splitlines():
+            low = line.strip().lower()
+            if not low:
+                continue
+            idx = low.find("maya")
+            while idx != -1:
+                tail = low[idx + 4: idx + 8]
+                if tail.isdigit():
+                    return tail
+                idx = low.find("maya", idx + 1)
+        return None
+
+    def _send_commandport(self, payload: str) -> bool:
+        """Sends a python payload to Maya's commandPort (any known port)."""
+        try:
+            import socket
+            for port in (7002, 7001, 7721, 6008, 7003, 7004):
+                try:
+                    sc = socket.socket()
+                    sc.settimeout(0.12)
+                    sc.connect(("127.0.0.1", port))
+                    sc.sendall((payload + "\n").encode())
+                    sc.close()
+                    return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    def _wait_maya_answer_file(self, path: str, timeout: float = 1.5) -> str | None:
+        """Poll a Maya-written answer file without freezing the UI."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            QApplication.processEvents()
+            if os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        return fh.read().strip()
+                except Exception:
+                    return None
+            time.sleep(0.02)
+        return None
+
+    def _maya_script_paths(self) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, pathlib.Path]:
+        """(sync.py, bootstrap.py, icon, shared scripts dir)."""
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            app_dir = pathlib.Path(sys._MEIPASS)
+        else:
+            app_dir = pathlib.Path(__file__).resolve().parent
+        src = app_dir / "maya_inkit_sync.py"
+        boot = app_dir / "inkit_bootstrap.py"
+        icon = app_dir / "shelf_icon.png"
+        if not icon.is_file():
+            icon = app_dir / "icon.png"
+        scripts = pathlib.Path.home() / "Documents" / "maya" / "scripts"
+        return src, boot, icon, scripts
+
+    _INKIT_USERSETUP_MARK_A = "# >>> InkIt Sync (auto) >>>"
+    _INKIT_USERSETUP_MARK_B = "# <<< InkIt Sync <<<"
+    _INKIT_USERSETUP_PY = (
+        "# >>> InkIt Sync (auto) >>>\n"
+        "def _inkit_boot():\n"
+        "    try:\n"
+        "        import sys, os\n"
+        "        d = os.path.join(os.path.expanduser('~'), 'Documents', 'maya', 'scripts')\n"
+        "        if d not in sys.path:\n"
+        "            sys.path.insert(0, d)\n"
+        "        import inkit_bootstrap\n"
+        "        inkit_bootstrap.ensure_port()\n"
+        "        inkit_bootstrap.install_shelf()\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "try:\n"
+        "    import maya.utils as _inkit_utils\n"
+        "    _inkit_utils.executeDeferred(_inkit_boot)\n"
+        "except Exception:\n"
+        "    _inkit_boot()\n"
+        "# <<< InkIt Sync <<<\n"
+    )
+    _INKIT_USERSETUP_MEL_A = "// >>> InkIt Sync (auto) >>>"
+    _INKIT_USERSETUP_MEL_B = "// <<< InkIt Sync <<<"
+    _INKIT_USERSETUP_MEL = (
+        "// >>> InkIt Sync (auto) >>>\n"
+        "catch (`commandPort -n \":7002\" -stp \"python\" -eo false`);\n"
+        "// <<< InkIt Sync <<<\n"
+    )
+
+    def _splice_marked_block(self, text: str, start: str, end: str, block: str) -> str:
+        raw = text or ""
+        if start in raw and end in raw:
+            i, j = raw.find(start), raw.find(end)
+            if 0 <= i < j:
+                return raw[:i] + block + raw[j + len(end):].lstrip("\n")
+        if raw.strip():
+            return raw.rstrip() + "\n\n" + block
+        return block
+
+    def _maya_script_dirs(self) -> list:
+        maya_docs = pathlib.Path.home() / "Documents" / "maya"
+        dirs = [maya_docs / "scripts"]
+        try:
+            for ver in maya_docs.iterdir():
+                if ver.is_dir() and ver.name[:1].isdigit():
+                    dirs.append(ver / "scripts")
+        except Exception:
+            pass
+        return dirs
+
+    def _deploy_maya_script_files(self) -> tuple[bool, str]:
+        """Copy sync + bootstrap + icon, and hook userSetup so Maya always listens."""
+        src, boot, icon_src, scripts = self._maya_script_paths()
+        if not src.is_file():
+            return False, "maya_inkit_sync.py is missing next to InkIt."
+        if not boot.is_file():
+            return False, "inkit_bootstrap.py is missing next to InkIt."
+        maya_docs = pathlib.Path.home() / "Documents" / "maya"
+        if not maya_docs.is_dir():
+            return False, "Maya not found at Documents/maya — is Maya installed?"
+        try:
+            for d in self._maya_script_dirs():
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "maya_inkit_sync.py").write_bytes(src.read_bytes())
+                (d / "inkit_bootstrap.py").write_bytes(boot.read_bytes())
+                if icon_src.is_file():
+                    (d / "InkIt.png").write_bytes(icon_src.read_bytes())
+                py = d / "userSetup.py"
+                old = py.read_text(encoding="utf-8", errors="ignore") if py.is_file() else ""
+                py.write_text(
+                    self._splice_marked_block(
+                        old, self._INKIT_USERSETUP_MARK_A, self._INKIT_USERSETUP_MARK_B,
+                        self._INKIT_USERSETUP_PY,
+                    ),
+                    encoding="utf-8",
+                )
+                mel = d / "userSetup.mel"
+                oldm = mel.read_text(encoding="utf-8", errors="ignore") if mel.is_file() else ""
+                mel.write_text(
+                    self._splice_marked_block(
+                        oldm, self._INKIT_USERSETUP_MEL_A, self._INKIT_USERSETUP_MEL_B,
+                        self._INKIT_USERSETUP_MEL,
+                    ),
+                    encoding="utf-8",
+                )
+        except Exception as e:
+            return False, f"Could not copy the Maya script:\n{e}"
+        return True, str(scripts)
+
+    def _install_payload(self) -> str:
+        return (
+            "try:\n"
+            "    import sys, os, importlib\n"
+            "    d = os.path.join(os.path.expanduser('~'), 'Documents', 'maya', 'scripts')\n"
+            "    if d not in sys.path:\n"
+            "        sys.path.insert(0, d)\n"
+            "    import inkit_bootstrap\n"
+            "    importlib.reload(inkit_bootstrap)\n"
+            "    inkit_bootstrap.run()\n"
+            "except Exception as _e:\n"
+            "    import os, tempfile\n"
+            "    p = os.path.join(tempfile.gettempdir(), 'inkit_shelf_install.txt')\n"
+            "    open(p, 'w', encoding='utf-8').write(f'0 error {_e}')\n"
+        )
+
+    def _wake_maya_via_command_line(self) -> None:
+        """If Maya is open but has no commandPort, drive its MEL command line."""
+        mel = 'python("import sys,os;d=os.path.join(os.path.expanduser(\'~\'),\'Documents\',\'maya\',\'scripts\');sys.path.insert(0,d) if d not in sys.path else None;import inkit_bootstrap;import importlib;importlib.reload(inkit_bootstrap);inkit_bootstrap.run()")'
+        try:
+            QGuiApplication.clipboard().setText(mel)
+        except Exception:
+            pass
+        ps = r"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class InkitWin {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+}
+"@
+$proc = Get-Process maya -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+if (-not $proc) { exit 2 }
+$hwnd = $proc.MainWindowHandle
+[InkitWin]::ShowWindow($hwnd, 9) | Out-Null
+[InkitWin]::SetForegroundWindow($hwnd) | Out-Null
+Start-Sleep -Milliseconds 200
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+if (-not $root) { exit 3 }
+$cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Edit)
+$edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+$best = $null
+$bestY = -1.0
+foreach ($e in $edits) {
+    $r = $e.Current.BoundingRectangle
+    if ($r.Width -lt 160) { continue }
+    if ($r.Height -gt 36) { continue }
+    if ($r.Y -gt $bestY) { $best = $e; $bestY = $r.Y }
+}
+if ($null -eq $best) { exit 4 }
+$best.SetFocus() | Out-Null
+Start-Sleep -Milliseconds 80
+[System.Windows.Forms.SendKeys]::SendWait("^a")
+Start-Sleep -Milliseconds 40
+[System.Windows.Forms.SendKeys]::SendWait("^v")
+Start-Sleep -Milliseconds 80
+[System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+"""
+        kwargs = {}
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-Command", ps],
+                timeout=8, **kwargs,
+            )
+        except Exception:
+            pass
+
+    def _install_maya_on_current_shelf(self) -> tuple[bool, str]:
+        """Deploy files, wake Maya if needed, check and put the button on the current active shelf."""
+        import tempfile
+        ok, info = self._deploy_maya_script_files()
+        if not ok:
+            return False, info
+        if not self._is_maya_running():
+            return True, (
+                "Maya scripts installed. When you open Maya, the InkIt Sync button "
+                "will appear on your active shelf."
+            )
+        ans = os.path.join(tempfile.gettempdir(), "inkit_shelf_install.txt")
+        try:
+            if os.path.exists(ans):
+                os.remove(ans)
+        except Exception:
+            pass
+        payload = self._install_payload()
+        sent = self._send_commandport(payload)
+        if not sent:
+            self._wake_maya_via_command_line()
+            QApplication.processEvents()
+            time.sleep(0.35)
+            QApplication.processEvents()
+            sent = self._send_commandport(payload)
+        reply = self._wait_maya_answer_file(ans, timeout=2.5)
+        if reply:
+            parts = reply.split(maxsplit=2)
+            status_code = parts[0] if len(parts) > 0 else "0"
+            action = parts[1] if len(parts) > 1 else ""
+            shelf = parts[2] if len(parts) > 2 else "current shelf"
+            if status_code == "1":
+                if action == "exists":
+                    return True, f"InkIt Sync is already installed on Maya shelf “{shelf}”. Click the InkIt button there to sync."
+                elif action == "created":
+                    return True, f"Installed InkIt Sync and created shelf button on Maya shelf “{shelf}”. Click the InkIt button there to sync."
+                else:
+                    return True, f"Installed on Maya shelf “{shelf}”. Click the InkIt button there to sync."
+            elif status_code == "0" and action == "error":
+                return False, f"Error installing in Maya: {shelf}"
+        if self._is_maya_running():
+            return False, (
+                "Maya is open, but its connection port is not active in this session yet.\n\n"
+                "To activate it in this open Maya session, run this in Maya's Script Editor (Python):\n"
+                "import inkit_bootstrap; inkit_bootstrap.run()\n\n"
+                "(The scripts and userSetup are already installed, so all future Maya launches will connect automatically)."
+            )
+        return True, (
+            "Maya scripts are installed. When you open Maya, InkIt appears on "
+            "whatever shelf is active — then click the InkIt button to sync."
+        )
+
+    def _live_maya_shelf_has_inkit(self, current_only: bool = True):
+        """Asks the running Maya (via its python commandPort) whether an InkIt
+        shelf button exists right now on the active shelf (or any shelf if current_only=False).
+        Returns True/False, or None if Maya can't answer (not running / port not open)."""
+        import os
+        import tempfile
+        ans = os.path.join(tempfile.gettempdir(), "inkit_shelf_answer.txt")
+        ans_fw = ans.replace("\\", "/")
+        try:
+            if os.path.exists(ans):
+                os.remove(ans)
+        except Exception:
+            pass
+        if current_only:
+            payload = (
+                "import os,tempfile\n"
+                "import maya.cmds as _c\n"
+                "_f = False\n"
+                "try:\n"
+                "    _t = _c.shelfTabLayout('ShelfLayout', q=True, selectTab=True)\n"
+                "    if _t:\n"
+                "        for _k in (_c.shelfLayout(_t, q=True, childArray=True) or []):\n"
+                "            try:\n"
+                "                if (_c.shelfButton(_k, q=True, annotation=True) or '') == 'InkIt Sync':\n"
+                "                    _f = True\n"
+                "                    break\n"
+                "            except Exception:\n"
+                "                pass\n"
+                "except Exception:\n"
+                "    pass\n"
+                f"open(r'{ans_fw}', 'w', encoding='utf-8').write('1' if _f else '0')\n"
+            )
+        else:
+            payload = (
+                "import os,tempfile\n"
+                "import maya.cmds as _c\n"
+                "_f = False\n"
+                "try:\n"
+                "    for _t in (_c.shelfTabLayout('ShelfLayout', q=True, childArray=True) or []):\n"
+                "        for _k in (_c.shelfLayout(_t, q=True, childArray=True) or []):\n"
+                "            try:\n"
+                "                if (_c.shelfButton(_k, q=True, annotation=True) or '') == 'InkIt Sync':\n"
+                "                    _f = True\n"
+                "                    break\n"
+                "            except Exception:\n"
+                "                pass\n"
+                "        if _f:\n"
+                "            break\n"
+                "except Exception:\n"
+                "    pass\n"
+                f"open(r'{ans_fw}', 'w', encoding='utf-8').write('1' if _f else '0')\n"
+            )
+        if not self._send_commandport(payload):
+            return None
+        reply = self._wait_maya_answer_file(ans, timeout=0.8)
+        if reply is None:
+            return None
+        return reply.strip() == "1"
+
+    def _push_maya_shelf_button(self) -> bool:
+        """Adds the InkIt button to Maya's currently active shelf using the
+        already-loaded maya_inkit_sync module — no import, so no sync window is
+        opened and no sync is started. Confirms via the live query."""
+        import time
+        payload = (
+            "import sys as _s\n"
+            "_m = _s.modules.get('maya_inkit_sync')\n"
+            "if _m is not None:\n"
+            "    try:\n"
+            "        _m._ensure_active_shelf_button()\n"
+            "    except Exception:\n"
+            "        pass\n"
+        )
+        if not self._send_commandport(payload):
+            return False
+        for _ in range(40):
+            if self._live_maya_shelf_has_inkit(current_only=True):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _try_load_maya_sync_via_commandport(self) -> bool:
+        """Re-runs maya_inkit_sync inside a live Maya session via its python
+        commandPort — opens the InkIt Sync window and refreshes the shelf.
+        The payload must be plain Python: the port is opened with
+        sourceType='python' (MEL-style python("...") wrappers fail there)."""
+        import socket
+        if not self._is_maya_running():
+            return False
+        payload = b"import sys;sys.modules.pop('maya_inkit_sync',None);import maya_inkit_sync\n"
+        for port in (7002, 7001, 7721, 6008, 7003, 7004):
+            sc = None
+            try:
+                sc = socket.socket()
+                sc.settimeout(0.25)
+                sc.connect(("127.0.0.1", port))
+                sc.sendall(payload)
+                return True
+            except Exception:
+                continue
+            finally:
+                try:
+                    if sc is not None:
+                        sc.close()
+                except Exception:
+                    pass
+        return False
+
+    def _is_maya_reachable(self) -> bool:
+        try:
+            import socket
+            s = socket.socket()
+            s.settimeout(0.08)
+            s.connect(("127.0.0.1", int(self._maya_send_port)))
+            s.close()
+            return True
+        except:
+            return False
+
+    def _ensure_maya_shelf_installed(self, silent=False) -> bool:
+        """Back-compat wrapper: current-shelf install only, no new InkIt tab."""
+        ok, detail = self._install_maya_on_current_shelf()
+        if not silent and not ok:
+            QMessageBox.warning(self, "InkIt Sync", detail)
+        return ok
+
+    def _send_maya_message_retry(self, msg: str, attempts: int = 8) -> None:
+        """Sends until Maya accepts it (its send port may still be binding)."""
+        if not self._is_maya_running():
+            return
+        for _ in range(attempts):
+            if self._send_maya_message(msg):
+                return
+            time.sleep(0.15)
+
+    def _toggle_maya_sync(self, on: bool) -> None:
+        self._settings["maya_sync"] = bool(on)
+        if on:
+            # Open/refresh the InkIt Sync window inside a running Maya (no-op
+            # when Maya is closed — the shelf button covers that case).
+            self._try_load_maya_sync_via_commandport()
+            # InkIt must listen on its port so Maya frames land here.
+            self._start_maya_server()
+            # Maya may still be binding its send port after the reload above.
+            self._send_maya_message_retry(f"SYNC {int(bool(on))}")
+        else:
+            self._stop_maya_server()
+            if not getattr(self, "_maya_sync_guard", False):
+                self._send_maya_message("SYNC 0")
+        self._update_maya_status_indicator()
+        self._schedule_save()
+
+    def _start_maya_server(self, silent: bool = False) -> None:
+        if self._maya_server is not None:
+            return
+        try:
+            from PySide6.QtNetwork import QTcpServer, QHostAddress
+        except Exception as e:
+            if not silent:
+                QMessageBox.warning(self, "Maya Sync", f"QtNetwork not available:\n{e}")
+            if hasattr(self, "act_maya_sync"):
+                self.act_maya_sync.setChecked(False)
+            return
+        srv = QTcpServer(self)
+        if not srv.listen(QHostAddress.SpecialAddress.LocalHost, int(self._maya_port)):
+            if not silent:
+                QMessageBox.warning(self, "Maya Sync", f"Can't listen on port {self._maya_port}:\n{srv.errorString()}")
+            if hasattr(self, "act_maya_sync"):
+                self.act_maya_sync.setChecked(False)
+            return
+        srv.newConnection.connect(self._handle_maya_connection)
+        self._maya_server = srv
+        self._update_maya_status_indicator()
+        if not silent:
+            self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset}  Maya {self._maya_offset}=InkIt 0)", 4000)
+
+    def _stop_maya_server(self) -> None:
+        if self._maya_server is not None:
+            try:
+                self._maya_server.close()
+                self._maya_server.deleteLater()
+            except Exception:
+                pass
+            self._maya_server = None
+        self._update_maya_status_indicator()
+        self.statusBar().showMessage("Maya Sync OFF", 2000)
+
+    def _handle_maya_connection(self) -> None:
+        if self._maya_server is None:
+            return
+        sock = self._maya_server.nextPendingConnection()
+        if sock is None:
+            return
+        sock.readyRead.connect(lambda s=sock: self._read_maya_socket(s))
+        sock.disconnected.connect(sock.deleteLater)
+        # data may already be available
+        try:
+            if sock.bytesAvailable():
+                self._read_maya_socket(sock)
+        except Exception:
+            pass
+
+    def _read_maya_socket(self, sock) -> None:
+        try:
+            data = bytes(sock.readAll()).decode(errors="ignore")
+        except Exception:
+            return
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.upper().startswith("FRAME"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        f = int(float(parts[1]))
+                        self._apply_maya_frame(f)
+                    except Exception:
+                        pass
+            elif line.upper().startswith("OFFSET"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        self._set_maya_offset(int(float(parts[1])), save=True)
+                    except Exception:
+                        pass
+            elif line.upper().startswith("SYNC"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        on = bool(int(float(parts[1])))
+                        self._maya_sync_guard = True
+                        try:
+                            self._settings["maya_sync"] = on
+                            self._update_maya_status_indicator()
+                        finally:
+                            self._maya_sync_guard = False
+                    except Exception:
+                        pass
+            elif line.upper().startswith("CURFRAME"):
+                # Maya's InkIt Sync window asked for the app's current frame.
+                self._send_inkit_frame_to_maya()
+            elif line.upper() == "PLAY":
+                self._maya_sync_guard = True
+                try:
+                    if not self.playing:
+                        self.playing = True
+                        self.btn_play.setIcon(self._play_icon(True))
+                        # in sync mode, don't start local timer — Maya drives frames
+                        if not bool(self._settings.get("maya_sync", False)):
+                            interval = max(8, int(1000 / max(self.project.fps, 1)))
+                            self.play_timer.start(interval)
+                            if self._player is not None and self.audio_on and not getattr(self.canvas, "is_board", False):
+                                self._sync_audio()
+                                self._player.play()
+                finally:
+                    self._maya_sync_guard = False
+            elif line.upper() == "PAUSE":
+                self._maya_sync_guard = True
+                try:
+                    if self.playing:
+                        self.playing = False
+                        self.play_timer.stop()
+                        self.btn_play.setIcon(self._play_icon(False))
+                        if self._player is not None:
+                            self._player.pause()
+                finally:
+                    self._maya_sync_guard = False
+
+    def _send_inkit_frame_to_maya(self) -> None:
+        """Maya's InkIt Sync window asked for the app's current frame."""
+        try:
+            f = int(self.canvas.current_frame)
+        except Exception:
+            return
+        self._send_maya_message(f"INKITFRAME {f}")
+
+    def _apply_maya_frame(self, maya_frame: int) -> None:
+        if not bool(self._settings.get("maya_sync", False)):
+            return
+        if self.project.frame_count <= 0:
+            return
+        inkit = int(maya_frame) - int(self._maya_offset)
+        inkit = max(0, min(inkit, int(self.project.frame_count) - 1))
+        # coalesce — Maya may send 60fps during drag/play, process at display rate
+        self._maya_pending_frame = inkit
+        if not self._maya_sync_timer.isActive():
+            self._maya_sync_timer.start()
+
+    def _process_maya_pending(self) -> None:
+        if self._maya_pending_frame is None:
+            self._maya_sync_timer.stop()
+            return
+        inkit = self._maya_pending_frame
+        self._maya_pending_frame = None
+        if inkit == int(self.canvas.current_frame):
+            if self._maya_pending_frame is None:
+                self._maya_sync_timer.stop()
+            return
+        self._maya_sync_guard = True
+        try:
+            if self.reader.cap is None and not getattr(self.canvas, "is_board", False) and not self._is_still:
+                self.canvas.current_frame = inkit
+                try:
+                    self.slider.blockSignals(True)
+                    self.slider.setValue(inkit)
+                finally:
+                    self.slider.blockSignals(False)
+                self._update_time_label()
+                self.canvas.update()
+            else:
+                self._show_frame(inkit)
+        finally:
+            self._maya_sync_guard = False
+            if self._maya_pending_frame is None:
+                self._maya_sync_timer.stop()
+            self._update_maya_status_indicator()
+
+    def _set_maya_offset(self, offset: int, save: bool = True) -> None:
+        self._maya_offset = int(offset)
+        self._settings["maya_offset"] = int(offset)
+        # per-shot remember
+        try:
+            if getattr(self.project, "path", None):
+                self._maya_offsets[str(self.project.path)] = int(offset)
+                self._settings["maya_offsets"] = dict(self._maya_offsets)
+        except Exception:
+            pass
+        if save:
+            self._schedule_save()
+        self._update_maya_status_indicator()
+        self.statusBar().showMessage(f"Maya offset: Maya {offset} = InkIt 0  (Maya {offset}+{self.canvas.current_frame}=InkIt {self.canvas.current_frame})", 4000)
+
+    def _prompt_maya_offset(self) -> None:
+        cur = int(self._maya_offset)
+        # suggest current Maya frame as zero mapping
+        hint = f"Which Maya frame should equal InkIt 0?\nCurrent: Maya {cur} = InkIt 0  (InkIt {self.canvas.current_frame} is Maya {cur + int(self.canvas.current_frame)})"
+        val, ok = QInputDialog.getInt(self, "Maya Start Frame", hint, cur, -1000000, 1000000, 1)
+        if ok:
+            self._set_maya_offset(int(val), save=True)
+            if self._maya_server is not None:
+                self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset})", 3000)
+
+    def _load_maya_offset_for_path(self, path: str | None) -> None:
+        if not path:
+            return
+        off = self._maya_offsets.get(str(path))
+        if off is not None:
+            self._maya_offset = int(off)
+
+    def _maybe_send_to_maya(self, inkit_frame: int) -> None:
+        if not bool(self._settings.get("maya_sync", False)):
+            return
+        if getattr(self, "_maya_sync_guard", False):
+            return
+        if time.time() < getattr(self, "_maya_send_fail_until", 0):
+            return
+        try:
+            import socket
+            maya_frame = int(inkit_frame) + int(self._maya_offset)
+            s = socket.socket()
+            s.settimeout(0.015)
+            s.connect(("127.0.0.1", int(self._maya_send_port)))
+            s.sendall(f"FRAME {maya_frame}\n".encode())
+            s.close()
+        except Exception:
+            self._maya_send_fail_until = time.time() + 1.0
+            pass
+
+    def _push_app_frame(self, inkit_frame: int) -> None:
+        if not bool(self._settings.get("maya_sync", False)):
+            return
+        if time.time() < getattr(self, "_maya_send_fail_until", 0):
+            return
+        try:
+            import socket
+            s = socket.socket()
+            s.settimeout(0.015)
+            s.connect(("127.0.0.1", int(self._maya_send_port)))
+            s.sendall(f"APPFRAME {int(inkit_frame)}\n".encode())
+            s.close()
+        except Exception:
+            self._maya_send_fail_until = time.time() + 1.0
+            pass
 
     def _toggle_loop(self) -> None:
         # Button clicks already flip check state; shortcuts do not.
@@ -5640,6 +7522,25 @@ class MainWindow(QMainWindow):
         return make_tool_icon("pause" if playing else "play")
 
     def _toggle_play(self) -> None:
+        # Maya sync: play/pause is driven by active window — if Maya is reachable, delegate
+        if bool(self._settings.get("maya_sync", False)) and not getattr(self, "_maya_sync_guard", False):
+            if self._is_maya_reachable():
+                will_play = not self.playing
+                self._send_maya_message("PLAY" if will_play else "PAUSE")
+                self.playing = will_play
+                self.btn_play.setIcon(self._play_icon(will_play))
+                if will_play:
+                    self.play_timer.stop()
+                    if self._player is not None:
+                        try: self._player.pause()
+                        except: pass
+                else:
+                    self.play_timer.stop()
+                    if self._player is not None:
+                        try: self._player.pause()
+                        except: pass
+                return
+            # Maya not running — fall through to local playback
         is_board = bool(getattr(self.canvas, "is_board", False))
         can_play = (not is_board and self.reader.cap is not None) or (
             is_board and self.project.frame_count > 1
@@ -5807,6 +7708,8 @@ class MainWindow(QMainWindow):
             return
         if isinstance(data, dict):
             self._settings.update(data)
+        # Live sync never resumes from the previous session — always start OFF.
+        self._settings["maya_sync"] = False
         self.time_mode = self._settings.get("time_mode", "frames")
         self.loop = bool(self._settings.get("loop", True))
         self.audio_on = bool(self._settings.get("audio", True))
@@ -5856,7 +7759,11 @@ class MainWindow(QMainWindow):
     def _write_app_settings(self) -> None:
         self._snapshot_tools()
         try:
-            self._settings_path().write_text(json.dumps(self._settings, indent=2), encoding="utf-8")
+            data = dict(self._settings)
+            # Sync state is session-only: the saved file always says OFF so the
+            # next launch opens with Maya sync disabled.
+            data["maya_sync"] = False
+            self._settings_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
             pass
 
@@ -6239,6 +8146,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev) -> None:
         """Clean shutdown handler saving autosave notes and settings."""
+        if getattr(self, "_pip_win", None) is not None:
+            try:
+                self._pip_win.hide()
+            except Exception:
+                pass
+            self._pip_win = None
         self._settings["win_geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
         self._autosave_notes()
         self._write_app_settings()
@@ -6292,6 +8205,28 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("InkIt")
     app.setStyle("Fusion")
+
+    _GUARD = "InkIt-SingleInstance"
+    try:
+        from PySide6.QtNetwork import QLocalServer, QLocalSocket
+        _probe = QLocalSocket()
+        _probe.connectToServer(_GUARD)
+        if _probe.waitForConnected(300):
+            try:
+                _probe.disconnectFromServer()
+            except Exception:
+                pass
+            try:
+                print("InkIt is already running.", file=sys.stderr)
+            except Exception:
+                pass
+            sys.exit(0)
+        _probe.abort()
+        QLocalServer.removeServer(_GUARD)
+        _single = QLocalServer()
+        _single.listen(_GUARD)
+    except Exception:
+        _single = None
     icon = app_icon_path()
     if not icon.is_file():
         try:
@@ -6308,6 +8243,21 @@ def main() -> None:
     if icon.is_file():
         w.setWindowIcon(QIcon(str(icon)))
     w.show()
+
+    def _focus_existing() -> None:
+        try:
+            w.showNormal()
+            w.raise_()
+            w.activateWindow()
+        except Exception:
+            pass
+
+    if _single is not None:
+        try:
+            _single.newConnection.connect(_focus_existing)
+        except Exception:
+            pass
+
     # No startup board: the window opens on an empty "Drag your video or image
     # here" state until a file is opened or dropped.
     # Handle files passed via command-line arguments (e.g. double-clicking an .inkit or video)
