@@ -601,17 +601,17 @@ if not _inkit_silent_install:
     cmds.columnLayout(adjustableColumn=True, rowSpacing=7, columnAttach=("both", 10))
 
     # Maya — Current Frame fills the Maya box from the timeline and applies.
-    cmds.rowLayout("inkit_mayaRow", numberOfColumns=3, columnWidth3=(62, 112, 62), adjustableColumn=3, columnAttach=[(1, "left", 0), (2, "left", 6), (3, "left", 6)])
+    cmds.rowLayout("inkit_mayaRow", numberOfColumns=4, columnWidth4=(62, 112, 50, 10), adjustableColumn=4, columnAttach=[(1, "left", 0), (2, "left", 6), (3, "left", 6)])
     cmds.text("inkit_mayaLabel", label="Maya", font="boldLabelFont", width=58, align="left")
     cmds.button("inkit_mayaBtn", label="Current Frame", width=108, height=22, backgroundColor=[0.43, 0.43, 0.43], command=_use_current)
-    cmds.intField("inkit_mayaField", value=int(float(cmds.currentTime(q=True))), width=58, height=22, changeCommand=_apply_link)
+    cmds.intField("inkit_mayaField", value=int(float(cmds.currentTime(q=True))), width=50, height=22, preventOverride=True, changeCommand=_apply_link)
     cmds.setParent("..")
 
     # Inkit — Current Frame pulls the app's live frame and applies the pair.
-    cmds.rowLayout("inkit_inkitRow", numberOfColumns=3, columnWidth3=(62, 112, 62), adjustableColumn=3, columnAttach=[(1, "left", 0), (2, "left", 6), (3, "left", 6)])
+    cmds.rowLayout("inkit_inkitRow", numberOfColumns=4, columnWidth4=(62, 112, 50, 10), adjustableColumn=4, columnAttach=[(1, "left", 0), (2, "left", 6), (3, "left", 6)])
     cmds.text("inkit_inkitLabel", label="Inkit", font="boldLabelFont", width=58, align="left")
     cmds.button("inkit_inkitBtn", label="Current Frame", width=108, height=22, backgroundColor=[0.43, 0.43, 0.43], command=_sync_inkit_frame)
-    cmds.intField("inkit_inkitField", value=0, width=58, height=22, changeCommand=_apply_link)
+    cmds.intField("inkit_inkitField", value=0, width=50, height=22, preventOverride=True, changeCommand=_apply_link)
     cmds.setParent("..")
 
     cmds.separator(height=4, style="single")
