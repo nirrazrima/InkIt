@@ -375,6 +375,23 @@ def _refresh_inkit_box_from_app(*_):
         return False
     return _send_to_inkit("CURFRAME?")
 
+def _go_drawing(msg):
+    if _send_to_inkit(msg):
+        print(f"[InkIt] Sent {msg} to app")
+        # ask the app right back for its current frame so the box/status bar
+        # show whether it actually jumped
+        try:
+            t = threading.Timer(0.15, _refresh_inkit_box_from_app)
+            t.daemon = True
+            t.start()
+        except:
+            _refresh_inkit_box_from_app()
+    else:
+        try:
+            cmds.warning("[InkIt] Can't reach the InkIt app on port 6005 — is it running?")
+        except:
+            pass
+
 def _use_current(*_):
     """Maya Current Frame: fill the Maya box from the timeline and apply the pair."""
     try:
@@ -511,6 +528,26 @@ try:
 except Exception:
     _INKIT_ICON = "InkIt"  # fall back to the name-based prefs/icons lookup
 
+# Previous/next drawing icons — same artwork the InkIt app uses, so the Maya
+# window buttons match the app. Looked up from the app's icons folder (or a
+# sibling 'icons' folder next to this script).
+def _find_draw_icon(name):
+    cands = []
+    try:
+        cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons"))
+    except:
+        pass
+    cands.append(r"D:\Apps\InkIt\icons")
+    cands.append(os.path.join(os.path.expanduser("~"), "Desktop", "InkIt", "icons"))
+    for c in cands:
+        p = os.path.join(c, name)
+        if os.path.isfile(p):
+            return p.replace("\\", "/")
+    return None
+
+_DRAW_ICON_PREV = _find_draw_icon("nav_prev_dot.png")
+_DRAW_ICON_NEXT = _find_draw_icon("nav_next_dot.png")
+
 def _ensure_active_shelf_button():
     """Adds the InkIt Sync button to the currently selected/visible (active)
     shelf only, and heals a stale one if present."""
@@ -613,6 +650,17 @@ if not _inkit_silent_install:
     cmds.button("inkit_inkitBtn", label="Current Frame", width=108, height=22, backgroundColor=[0.43, 0.43, 0.43], command=_sync_inkit_frame)
     cmds.intField("inkit_inkitField", value=0, width=50, height=22, preventOverride=True, changeCommand=_apply_link)
     cmds.setParent("..")
+
+    if _DRAW_ICON_PREV and _DRAW_ICON_NEXT:
+        cmds.rowLayout("inkit_drawRow", numberOfColumns=3, adjustableColumn=3, columnAttach=[(1, "left", 0), (2, "left", 4)])
+        cmds.symbolButton("inkit_prevDrawBtn", image=_DRAW_ICON_PREV, width=30, height=30, annotation="Jump to previous drawing", command=lambda *_: _go_drawing("PREVDRAW"))
+        cmds.symbolButton("inkit_nextDrawBtn", image=_DRAW_ICON_NEXT, width=30, height=30, annotation="Jump to next drawing", command=lambda *_: _go_drawing("NEXTDRAW"))
+        cmds.setParent("..")
+    else:
+        cmds.rowLayout("inkit_drawRow", numberOfColumns=3, columnWidth3=(150, 160, 10), adjustableColumn=3, columnAttach=[(1, "left", 0), (2, "left", 4)])
+        cmds.button("inkit_prevDrawBtn", label="◀ Previous Drawing", width=146, height=22, backgroundColor=[0.33, 0.40, 0.52], command=lambda *_: _go_drawing("PREVDRAW"))
+        cmds.button("inkit_nextDrawBtn", label="Next Drawing ▶", width=156, height=22, backgroundColor=[0.33, 0.40, 0.52], command=lambda *_: _go_drawing("NEXTDRAW"))
+        cmds.setParent("..")
 
     cmds.separator(height=4, style="single")
 

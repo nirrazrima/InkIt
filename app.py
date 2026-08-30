@@ -7298,6 +7298,37 @@ Start-Sleep -Milliseconds 80
         except Exception:
             pass
 
+    def _goto_drawing(self, direction: int) -> None:
+        """Jump to the next/previous drawing (annotated frame) in the project."""
+        try:
+            frames = self.project.annotated_frames()
+            if not frames:
+                self.statusBar().showMessage("InkIt: no drawings to jump to", 3000)
+                return
+            cur = int(self.canvas.current_frame)
+            target = None
+            if direction > 0:
+                for f in frames:
+                    if f > cur:
+                        target = f
+                        break
+                if target is None:
+                    target = frames[0]
+            else:
+                for f in reversed(frames):
+                    if f < cur:
+                        target = f
+                        break
+                if target is None:
+                    target = frames[-1]
+            if target is not None and target != cur:
+                self._show_frame(target)
+                self.statusBar().showMessage(f"InkIt drawing: frame {target}", 3000)
+            else:
+                self.statusBar().showMessage("InkIt: already at the drawing edge", 3000)
+        except Exception as e:
+            self.statusBar().showMessage(f"InkIt drawing nav error: {e}", 4000)
+
     def _read_maya_socket(self, sock) -> None:
         try:
             data = bytes(sock.readAll()).decode(errors="ignore")
@@ -7338,6 +7369,10 @@ Start-Sleep -Milliseconds 80
             elif line.upper().startswith("CURFRAME"):
                 # Maya's InkIt Sync window asked for the app's current frame.
                 self._send_inkit_frame_to_maya()
+            elif line.upper().startswith("NEXTDRAW"):
+                self._goto_drawing(1)
+            elif line.upper().startswith("PREVDRAW"):
+                self._goto_drawing(-1)
             elif line.upper() == "PLAY":
                 self._maya_sync_guard = True
                 try:
