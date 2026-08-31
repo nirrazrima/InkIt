@@ -18,7 +18,8 @@ HOST = "127.0.0.1"
 INKIT_PORT = 6005
 MAYA_PORT = 6006
 
-def _send_to_inkit(msg):
+def _raw_send_to_inkit(msg):
+    """Actual TCP send — runs only on the background sender thread."""
     try:
         s = socket.socket()
         s.settimeout(0.04)
@@ -28,6 +29,46 @@ def _send_to_inkit(msg):
         return True
     except:
         return False
+
+# All outgoing messages flow through a single daemon thread so the Maya main
+# thread never blocks on network I/O. A busy/just-started InkIt app used to
+# stall connect() inside the 16ms frame-change events until the timeout and
+# briefly freeze Maya every time that happened.
+import collections
+_inkit_out_queue = collections.deque()
+_inkit_out_cond = threading.Condition()
+if globals().get("_inkit_sender_started") is None:
+    globals()["_inkit_sender_started"] = False
+
+def _inkit_sender_worker():
+    while True:
+        with _inkit_out_cond:
+            while not _inkit_out_queue:
+                _inkit_out_cond.wait()
+            msg = _inkit_out_queue.popleft()
+            # coalesce: a burst of FRAME msgs during scrub/play — only the newest matters
+            if msg.startswith("FRAME "):
+                while _inkit_out_queue and _inkit_out_queue[0].startswith("FRAME "):
+                    msg = _inkit_out_queue.popleft()
+        if not _raw_send_to_inkit(msg) and not msg.startswith("FRAME "):
+            try:
+                print(f"[InkIt] Can't reach the InkIt app on port {INKIT_PORT} — is it running?")
+            except:
+                pass
+
+def _send_to_inkit(msg):
+    """Fire-and-forget: enqueue on the sender thread — never blocks the caller."""
+    with _inkit_out_cond:
+        _inkit_out_queue.append(msg)
+        _inkit_out_cond.notify()
+    if not globals().get("_inkit_sender_started", False):
+        globals()["_inkit_sender_started"] = True
+        try:
+            t = threading.Thread(target=_inkit_sender_worker, daemon=True)
+            t.start()
+        except Exception:
+            pass
+    return True
 
 def _run_main(fn):
     """Run a Maya-UI function on the main thread (server thread must never touch UI)."""

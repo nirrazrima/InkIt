@@ -3065,7 +3065,7 @@ class Canvas(QWidget):
         p.end()
 
     def _draw_frame_hud(self, p: QPainter) -> None:
-        """Draws the frame counter badge (top-right). Skipped when disabled/empty."""
+        """Draws the frame counter badge (top-left). Skipped when disabled/empty."""
         if not getattr(self, "frame_overlay", False) or not self.frame_overlay_text:
             return
         f = self.font()
@@ -3077,7 +3077,7 @@ class Canvas(QWidget):
         pad = 10
         tw = metrics.horizontalAdvance(text) + pad * 2
         th = metrics.height() + pad
-        box = QRectF(self.width() - tw - pad, pad, tw, th)
+        box = QRectF(pad, pad, tw, th)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0, 140))
         p.drawRoundedRect(box, 4, 4)
@@ -3990,6 +3990,14 @@ class PipWindow(QWidget):
       current frame of the same project, autosaved like normal notes)
     """
 
+    _RESIZE_MARGIN = 8
+    _EDGE_CURSORS = {
+        "tl": Qt.CursorShape.SizeFDiagCursor, "br": Qt.CursorShape.SizeFDiagCursor,
+        "tr": Qt.CursorShape.SizeBDiagCursor, "bl": Qt.CursorShape.SizeBDiagCursor,
+        "l": Qt.CursorShape.SizeHorCursor,  "r": Qt.CursorShape.SizeHorCursor,
+        "t": Qt.CursorShape.SizeVerCursor,  "b": Qt.CursorShape.SizeVerCursor,
+    }
+
     def __init__(self, main_win: "MainWindow"):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.main_win = main_win
@@ -4000,6 +4008,9 @@ class PipWindow(QWidget):
         self.resize(480, 270)
         self.setMinimumSize(240, 160)
         self._drag_pos = None
+        self._resize_edge = None
+        self._resize_geo = None
+        self._resize_start = None
         self._mouse_inside = False
         # drawing state
         self._draw_mode = False
@@ -4011,6 +4022,7 @@ class PipWindow(QWidget):
         self._video_img: QImage | None = None
         self._ink: QImage | None = None          # committed strokes layer
         self._ink_key = None
+        self._ink_painted = 0                    # strokes successfully painted into _ink
         self._active: QImage | None = None       # in-progress stroke layer
         self._n_rend = 0
         self._marks_tick = 0
@@ -4191,6 +4203,7 @@ class PipWindow(QWidget):
             self._video_key = None
             self._ink_key = None
             self._ink = None
+            self._ink_painted = 0
             self._active = None
             self._n_rend = 0
         return self._dst
@@ -4227,6 +4240,64 @@ class PipWindow(QWidget):
 
     def _end_scrub(self) -> None:
         self._scrub_x = None
+
+    # -- frameless edge/corner resizing ------------------------------------
+
+    def _edge_at(self, pos) -> str:
+        """Which resize edge/corner the cursor sits on ('' = none)."""
+        w, h = self.width(), self.height()
+        m = self._RESIZE_MARGIN
+        x, y = float(pos.x()), float(pos.y())
+        left = x <= m
+        right = x >= w - m
+        top = y <= m
+        bottom = y >= h - m
+        if left and top:
+            return "tl"
+        if right and top:
+            return "tr"
+        if left and bottom:
+            return "bl"
+        if right and bottom:
+            return "br"
+        if left:
+            return "l"
+        if right:
+            return "r"
+        if top:
+            return "t"
+        if bottom:
+            return "b"
+        return ""
+
+    def _resize_from_global(self, gpos) -> None:
+        gx, gy = gpos.x(), gpos.y()
+        dx = gx - self._resize_start.x()
+        dy = gy - self._resize_start.y()
+        bx, by, bw, bh = self._resize_geo.getRect()
+        minw = max(int(self.minimumWidth()), 240)
+        minh = max(int(self.minimumHeight()), 160)
+        e = self._resize_edge
+        x, y, w, h = bx, by, bw, bh
+        if "l" in e:
+            w = bw - dx
+            if w < minw:
+                w = minw
+            x = bx + bw - w
+        if "r" in e:
+            w = bw + dx
+            if w < minw:
+                w = minw
+        if "t" in e:
+            h = bh - dy
+            if h < minh:
+                h = minh
+            y = by + bh - h
+        if "b" in e:
+            h = bh + dy
+            if h < minh:
+                h = minh
+        self.setGeometry(x, y, w, h)
 
     # -- view navigation (Alt gestures — mirror the main canvas) ----------
 
@@ -4458,13 +4529,16 @@ class PipWindow(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, aa)
         shim = _PipPaintShim(QRectF(0, 0, ls.width(), ls.height()), self._media_size()[0], self._media_size()[1])
         r = QRectF(0, 0, ls.width(), ls.height())
-        try:
-            for s in strokes:
+        painted = 0
+        for s in strokes:
+            try:
                 Canvas._paint_stroke(shim, p, s, r)
-        except Exception:
-            pass
+                painted += 1
+            except Exception:
+                pass
         p.end()
         self._ink = img
+        self._ink_painted = painted
         self._ink_key = key
 
     def _ensure_active_layer(self) -> None:
@@ -4559,6 +4633,8 @@ class PipWindow(QWidget):
         video = self._video_image()
         if video is None:
             return None
+        f = int(cv.current_frame)
+        has_strokes = any(bool(s.points) for s in mw.project.strokes_at(f))
         pm = QPixmap.fromImage(video)
         p = QPainter(pm)
         try:
@@ -4579,12 +4655,20 @@ class PipWindow(QWidget):
                     p.drawImage(0, 0, ink)
         finally:
             p.end()
+        # Drawings must never vanish from the PiP: if the pip's own stroke
+        # compositor painted nothing for a frame that has strokes, mirror the
+        # app canvas so the PiP always shows exactly what the app shows.
+        if has_strokes and not getattr(self, "_ink_painted", 0) and not self._draw_mode:
+            try:
+                g = mw.canvas.grab()
+                if not g.isNull():
+                    return g
+            except Exception:
+                pass
         return pm
 
     def _draw_hud(self, p: QPainter, w: int, h: int) -> None:
-        """Frame counter badge on the PiP video — always visible, top-right but
-        offset left of the floating exit/pen buttons (at w-34) so it never sits
-        behind them."""
+        """Frame counter badge on the PiP video — always visible, top-left."""
         cv = self.main_win.canvas
         if not cv.frame_overlay_text:
             return
@@ -4597,8 +4681,7 @@ class PipWindow(QWidget):
         pad = 10
         tw = metrics.horizontalAdvance(text) + pad * 2
         th = metrics.height() + pad
-        # 34 = button x-offset from right, 10 = gap to button
-        box = QRectF(w - tw - 44, pad, tw, th)
+        box = QRectF(pad, pad, tw, th)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0, 140))
         p.drawRoundedRect(box, 4, 4)
@@ -4681,6 +4764,7 @@ class PipWindow(QWidget):
         self._video_key = None
         self._ink_key = None
         self._ink = None
+        self._ink_painted = 0
         self._active = None
         self._n_rend = 0
         super().resizeEvent(ev)
@@ -4724,11 +4808,23 @@ class PipWindow(QWidget):
             self._begin_stroke(pos, 0.75, eraser)
             ev.accept()
             return
+        edge = self._edge_at(pos) if not self._draw_mode else ""
+        if edge and ev.button() == Qt.MouseButton.LeftButton and not alt:
+            self._resize_edge = edge
+            self._resize_geo = self.geometry()
+            self._resize_start = ev.globalPosition().toPoint()
+            self.setCursor(self._EDGE_CURSORS[edge])
+            ev.accept()
+            return
         if ev.button() == Qt.MouseButton.LeftButton and not alt:
             self._drag_pos = ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
+        if self._resize_edge is not None and (ev.buttons() & Qt.MouseButton.LeftButton):
+            self._resize_from_global(ev.globalPosition().toPoint())
+            ev.accept()
+            return
         if self._zooming:
             self._move_zoom(ev.position().y())
             ev.accept()
@@ -4748,6 +4844,16 @@ class PipWindow(QWidget):
             return
         if self._drag_pos is not None and ev.buttons() & Qt.MouseButton.LeftButton:
             self.move(ev.globalPosition().toPoint() - self._drag_pos)
+        if (
+            self._stroke is None and self._resize_edge is None
+            and not self._zooming and not self._panning and self._scrub_x is None
+            and self._drag_pos is None and not ev.buttons()
+        ):
+            if self._draw_mode:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                e = self._edge_at(ev.position())
+                self.setCursor(self._EDGE_CURSORS.get(e, Qt.CursorShape.ArrowCursor))
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
@@ -4766,6 +4872,12 @@ class PipWindow(QWidget):
             return
         if ev.button() == Qt.MouseButton.MiddleButton and self._scrub_x is not None:
             self._end_scrub()
+            ev.accept()
+            return
+        if self._resize_edge is not None:
+            self._resize_edge = None
+            self._resize_geo = None
+            self._resize_start = None
             ev.accept()
             return
         self._drag_pos = None
@@ -7174,7 +7286,8 @@ Start-Sleep -Milliseconds 80
         for _ in range(40):
             if self._live_maya_shelf_has_inkit(current_only=True):
                 return True
-            time.sleep(0.1)
+            QApplication.processEvents()  # keep the 6005 sync port accepting while polling
+            time.sleep(0.02)
         return False
 
     def _try_load_maya_sync_via_commandport(self) -> bool:
@@ -7229,7 +7342,8 @@ Start-Sleep -Milliseconds 80
         for _ in range(attempts):
             if self._send_maya_message(msg):
                 return
-            time.sleep(0.15)
+            QApplication.processEvents()  # keep the sync port accepting while retrying
+            time.sleep(0.05)
 
     def _toggle_maya_sync(self, on: bool) -> None:
         self._settings["maya_sync"] = bool(on)
