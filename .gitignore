@@ -2,7 +2,8 @@
 __pycache__/
 *.pyc
 backups/
-dist/
+dist/*
+!dist/InkIt.exe
 build/
 dist_pi/
 # Compiled build artifacts (keep spec/bat tracked)
