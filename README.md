@@ -6,6 +6,14 @@ InkIt was designed as a lightweight, frame-accurate companion for reviewing and 
 
 ---
 
+## Screenshots
+
+| Annotating a sequence | Reviewing in Maya Sync | Frame-accurate review |
+| :---: | :---: | :---: |
+| ![Annotating a sequence](screenshots/annotation.png) | ![Reviewing with Maya Sync](screenshots/maya-sync.png) | ![Frame-accurate review](screenshots/review.png) |
+
+---
+
 ## What you can do with InkIt
 
 ### Draw on your footage
