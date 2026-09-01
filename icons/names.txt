@@ -20,6 +20,7 @@ slider_hardness.png  |  Brush hardness slider logo
 slider_opacity.png  |  Pen opacity slider logo
 slider_clip.png  |  Clip opacity slider logo
 slider_notes.png  |  Notes opacity slider logo
+slider_lazy.png  |  Lazy mouse smoothing slider logo
 nav_prev.png  |  Previous frame (<)
 nav_next.png  |  Next frame (>)
 nav_prev_dot.png  |  Jump to previous drawing (|<)

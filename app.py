@@ -1444,6 +1444,27 @@ def _paint_notes_glyph(p: QPainter, cx: float, cy: float) -> None:
         p.drawPolyline(pts)
 
 
+def _paint_lazy_glyph(p: QPainter, cx: float, cy: float) -> None:
+    """Lazy mouse: a smooth drawn line that trails a small cursor head, with the
+    gap between them showing the stabilization lag."""
+    base = QColor("#e8eaf0")
+    pen = QPen(base, 2.0)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    # trailing smooth stroke that lags behind the head
+    pts = QPolygonF()
+    for i in range(21):
+        t = i / 20.0
+        x = cx - 8.0 + 15.0 * t
+        y = cy + 1.2 * math.sin(2.2 * math.pi * t) - 3.0
+        pts.append(QPointF(x, y))
+    p.drawPolyline(pts)
+    # cursor head (a small offset dot = the live pointer)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(base)
+    p.drawEllipse(QPointF(cx + 7.0, cy + 2.0), 2.6, 2.6)
+
+
 class BoxSlider(QWidget):
     """Minimalist slider row: [glyph or title] [thin track] [value]."""
     valueChanged = Signal(int)
@@ -1505,6 +1526,9 @@ class BoxSlider(QWidget):
     def _draw_notes_icon(self, p: QPainter, cx: float, cy: float) -> None:
         _paint_notes_glyph(p, cx, cy)
 
+    def _draw_lazy_icon(self, p: QPainter, cx: float, cy: float) -> None:
+        _paint_lazy_glyph(p, cx, cy)
+
     def paintEvent(self, _ev) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -1520,7 +1544,7 @@ class BoxSlider(QWidget):
             )
         elif self.icon_kind == "hardness":
             self._draw_hardness_icon(p, x + 18.0, cy, 16.0)
-        elif self.icon_kind in ("opacity", "clip", "notes"):
+        elif self.icon_kind in ("opacity", "clip", "notes", "lazy"):
             p.save()
             p.translate(x + 18.0, cy)
             p.scale(2.0, 2.0)
@@ -1528,6 +1552,7 @@ class BoxSlider(QWidget):
                 "opacity": self._draw_opacity_icon,
                 "clip": self._draw_clip_icon,
                 "notes": self._draw_notes_icon,
+                "lazy": self._draw_lazy_icon,
             }[self.icon_kind](p, 0.0, 0.0)
             p.restore()
         else:
@@ -2519,6 +2544,7 @@ ICON_NAMES: dict[str, str] = {
     "slider_opacity": "Pen opacity slider logo",
     "slider_clip": "Clip opacity slider logo",
     "slider_notes": "Notes opacity slider logo",
+    "slider_lazy": "Lazy mouse smoothing slider logo",
     "nav_prev": "Previous frame (<)",
     "nav_next": "Next frame (>)",
     "nav_prev_dot": "Jump to previous drawing (|<)",
@@ -2540,7 +2566,8 @@ def _render_icon_png(name: str) -> QPixmap:
         else:
             {"opacity": _paint_opacity_glyph,
              "clip": _paint_clip_glyph,
-             "notes": _paint_notes_glyph}[kind](p, 16.0, 16.0)
+             "notes": _paint_notes_glyph,
+             "lazy": _paint_lazy_glyph}[kind](p, 16.0, 16.0)
         p.end()
         return pm
     if name.startswith("nav_"):
@@ -2632,6 +2659,7 @@ def default_settings() -> dict:
         "swatch_colors": list(SWATCH_COLORS_DEFAULT),
         "brush": 6,
         "hardness": 100,
+        "lazy_mouse": 0,
         "pen_antialias": True,
         "cursor_mode": "circle",
         "cursor_custom": "",
@@ -2737,6 +2765,8 @@ class Canvas(QWidget):
         self.color = QColor("#ff3b30")      # Current stroke color
         self.brush = 6.0                    # Base stroke width in pixels
         self.pen_opacity = 1.0              # Stroke opacity (0.0 to 1.0)
+        self.lazy_strength = 0.0            # Lazy mouse / stroke stabilization (0..1)
+        self._smooth_pos: QPointF | None = None
         self.clip_opacity = 1.0             # Video clip background opacity (0.0 to 1.0)
         self.notes_opacity = 1.0            # Annotations layer opacity (0.0 to 1.0)
         self.notes_visible = True           # Master visibility toggle for annotations
@@ -2770,6 +2800,10 @@ class Canvas(QWidget):
         self._gesture_moved = False  # true once an active drag exceeds tap tolerance
         self._middle_scrub = False
         self._middle_last_x = 0.0
+        self._scrub_acc = 0.0
+        self._scrub_timer = QTimer(self)
+        self._scrub_timer.setInterval(15)
+        self._scrub_timer.timeout.connect(self._scrub_poll)
         self.fade_color = QColor("#ffffff") # Background fade color behind transparent clip
         self.hardness = 1.0                 # Brush hardness (0.0 soft .. 1.0 hard)
         self.pressure_curve = [list(p) for p in DEFAULT_PRESSURE_CURVE]  # stylus pressure -> width fraction of pen size
@@ -3362,17 +3396,38 @@ class Canvas(QWidget):
         self._dst = self._fit()
         self._active = None
         self._rendered = 0
+        self._smooth_pos = QPointF(n.x(), n.y())
         self._ensure_active()
         self._push_draw_cursor()
         self.update()
 
     def _move(self, pos: QPointF, pressure: float) -> None:
-        """Appends new sample point to the active stroke."""
+        """Appends new sample point to the active stroke.
+
+        When lazy mouse (smoothing) is active, the written point trails the real
+        cursor: it is pulled toward the previous point by `lazy_strength`, so a
+        higher % produces a smoother, more stabilized stroke (like Photoshop /
+        Krita stabilizers)."""
         if not self._drawing or self._stroke is None:
             return
         n = self._to_norm(pos)
         if n is None:
             return
+        if self._smooth_pos is None:
+            _last = self._stroke.points[-1]
+            self._smooth_pos = QPointF(_last.x, _last.y)
+        strength = min(max(float(getattr(self, "lazy_strength", 0.0)), 0.0), 1.0)
+        if strength > 0.0:
+            # effective intensity = strength * 0.9, then doubled (2x stronger);
+            # capped so even 100% never fully freezes the line
+            eff = min(strength * 0.9 * 2.0, 0.95)
+            k = 1.0 - eff
+            sp = self._smooth_pos
+            self._smooth_pos = QPointF(
+                sp.x() + (n.x() - sp.x()) * k,
+                sp.y() + (n.y() - sp.y()) * k,
+            )
+            n = self._smooth_pos
         last = self._stroke.points[-1]
         dx, dy = n.x() - last.x, n.y() - last.y
         if (dx * dx + dy * dy) < 1e-8:
@@ -3389,6 +3444,7 @@ class Canvas(QWidget):
         s = self._stroke
         self._drawing = False
         self._stroke = None
+        self._smooth_pos = None
         if s is not None and self._committed is not None:
             cp = QPainter(self._committed)
             if s.eraser:
@@ -3412,24 +3468,58 @@ class Canvas(QWidget):
     # -----------------------------------------------------------------------
     def _start_scrub(self, x: float) -> None:
         self._middle_scrub = True
-        self._middle_last_x = x
+        self._middle_last_x = QCursor.pos().x()
+        self._scrub_acc = 0.0
         self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self._scrub_timer.start()
 
     def _stop_scrub(self) -> None:
         if self._middle_scrub:
             self._middle_scrub = False
+            self._scrub_timer.stop()
+            self._scrub_acc = 0.0
             self._apply_brush_cursor()
 
-    def _scrub_move(self, x: float) -> None:
-        dx = x - self._middle_last_x
+    def _scrub_poll(self) -> None:
+        """Polled while middle-scrub is active: reads the live global cursor and
+        steps frames. Polling (rather than mouseMoveEvent) keeps scrubbing smooth
+        across multiple monitors, even when the wrapped cursor leaves this widget."""
+        if not self._middle_scrub:
+            self._scrub_timer.stop()
+            return
+        self._scrub_move(QCursor.pos().x())
+
+    def _scrub_move(self, _x: float) -> None:
+        gp = QCursor.pos()
+        gx = gp.x()
+
+        # dx is the REAL physical mouse travel since the last update
+        dx = gx - self._middle_last_x
+        self._middle_last_x = gx
+
+        # Wrap across the WHOLE virtual desktop (all monitors side by side), so a
+        # middle-scrub drag can keep going forever: reaching the far right of the
+        # rightmost monitor jumps to the far left of the leftmost monitor (and
+        # vice-versa), regardless of how many screens are in between.
+        vge = QGuiApplication.primaryScreen().virtualGeometry()
+        left, right = vge.left(), vge.right()
+        if gx >= right and dx > 0:
+            nw = left + 1
+            QCursor.setPos(nw, gp.y())
+            self._middle_last_x = nw
+        elif gx <= left and dx < 0:
+            nw = right - 1
+            QCursor.setPos(nw, gp.y())
+            self._middle_last_x = nw
+
         step = 8.0  # Pixels per frame step
         if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
             step *= 5.0  # Ctrl = fine scrubbing (5x more pixels per frame)
-        if abs(dx) >= step:
-            frames = int(dx / step)
-            self._middle_last_x = x
-            if frames:
-                self.frameDelta.emit(frames)
+        self._scrub_acc += dx / step
+        frames = int(self._scrub_acc)
+        if frames:
+            self._scrub_acc -= frames
+            self.frameDelta.emit(frames)
 
     # -----------------------------------------------------------------------
     # Mouse & Tablet Input Events
@@ -5317,19 +5407,23 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.btn_picker)
         bar.addWidget(self.btn_tool)
 
-        # --- [BOXES] Brush Hardness (top row) + Pen Opacity (bottom row) ---
+        # --- [BOXES] Brush Hardness (top row) + Pen Opacity (middle) + Lazy Mouse (bottom) ---
         self.sl_hard = BoxSlider("Hardness", 0, 100, 100, "%", icon="hardness")
         self.sl_hard.setToolTip("Hardness — click or drag anywhere to adjust")
         self.sl_hard.valueChanged.connect(self._hardness_changed)
         self.sl_pen_op = BoxSlider("Opacity", 0, 100, 100, "%", icon="opacity")
         self.sl_pen_op.setToolTip("Opacity — click or drag anywhere to adjust")
         self.sl_pen_op.valueChanged.connect(self._pen_opacity_changed)
+        self.sl_lazy = BoxSlider("Lazy", 0, 100, 0, "%", icon="lazy")
+        self.sl_lazy.setToolTip("Lazy mouse — stroke smoothing / stabilization, higher = smoother")
+        self.sl_lazy.valueChanged.connect(self._lazy_changed)
         pen_stack = QWidget()
         pen_stack_lay = QVBoxLayout(pen_stack)
         pen_stack_lay.setContentsMargins(0, 0, 0, 0)
         pen_stack_lay.setSpacing(1)
         pen_stack_lay.addWidget(self.sl_hard)
         pen_stack_lay.addWidget(self.sl_pen_op)
+        pen_stack_lay.addWidget(self.sl_lazy)
         bar.addWidget(pen_stack)
 
         bar.addWidget(self._vline())
@@ -5767,6 +5861,11 @@ class MainWindow(QMainWindow):
     def _hardness_changed(self, v: int) -> None:
         self.canvas.hardness = min(max(int(v), 0), 100) / 100.0
         self._settings["hardness"] = int(v)
+        self._schedule_save()
+
+    def _lazy_changed(self, v: int) -> None:
+        self.canvas.lazy_strength = min(max(int(v), 0), 100) / 100.0
+        self._settings["lazy_mouse"] = int(v)
         self._schedule_save()
 
     def _brush_smaller(self) -> None:
@@ -7882,6 +7981,7 @@ Start-Sleep -Milliseconds 80
         self._settings["notes_visible"] = bool(self.btn_hide.isChecked())
         self._settings["tool"] = self.canvas.tool
         self._settings["hardness"] = int(self.sl_hard.value())
+        self._settings["lazy_mouse"] = int(self.sl_lazy.value())
         self._settings["pen_antialias"] = bool(self.canvas.antialias)
         self._settings["cursor_mode"] = self.canvas.cursor_mode
         self._settings["cursor_custom"] = self.canvas.cursor_custom
@@ -7927,6 +8027,8 @@ Start-Sleep -Milliseconds 80
         self.sl_clip_op.setValue(int(s.get("clip_opacity", 100)))
         self.sl_notes_op.setValue(int(s.get("notes_opacity", 100)))
         self.sl_hard.setValue(int(s.get("hardness", 100)))
+        self.sl_lazy.setValue(int(s.get("lazy_mouse", 0)))
+        self.canvas.lazy_strength = min(max(int(s.get("lazy_mouse", 0)), 0), 100) / 100.0
         self.canvas.antialias = bool(s.get("pen_antialias", True))
         self.canvas.board_bg = QColor(s.get("board_bg", "#ffffff"))
         self.canvas.onion_prev = QColor(s.get("onion_prev", "#c248ff"))
