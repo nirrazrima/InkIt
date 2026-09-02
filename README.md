@@ -1,8 +1,20 @@
 # InkIt
 
-**InkIt** is a local, single-file video annotation and animation-review player for Windows. It lets you draw directly on top of video frames — frame by frame — the way animators annotate dailies, boards, and animatics. It is fully self-contained: one executable, no Python, FFmpeg, or Qt install required.
+**InkIt** is a local, video and image annotation and animation-review player for Windows. It lets you draw directly on top of video frames — frame by frame — the way animators annotate dailies, boards, and animatics. It is fully self-contained: one executable, no Python, FFmpeg, or Qt install required.
 
 InkIt was designed as a lightweight, frame-accurate companion for reviewing and marking up sequence work, and it pairs tightly with Autodesk Maya for live, two-way frame syncing during animation review.
+it also autosave based on each stroke so you never lose the notes, 
+you can share the .json file, with others and if location of the clips are on same path, it just opens the flowlessly.
+
+I have design this based on my own way of working with wacom, and I believe it's very easy to adjust to it.
+
+Since I work on Maya most of the time, I can use this tool as a video reference player, that syncs with your notes.
+
+I haven't test it on other machine and just saving it here for a back up, so please test it and leave me some feedback. 
+
+I would love to continue improving it.
+
+If you are an UI/UX artists and interested in the tool please get in touch to make it look better.
 
 ---
 
@@ -39,11 +51,12 @@ InkIt was designed as a lightweight, frame-accurate companion for reviewing and 
 - InkIt and Autodesk Maya talk over a local two-way connection, letting you review animation directly against a frame-accurate playblast while keeping both apps in sync.
 - Use the **InkIt Sync** panel/shelf button in Maya to match InkIt to Maya's current frame — live, including during playback or scrubbing — with a configurable **frame offset** so Maya frames map exactly to your InkIt frames (offsets are remembered per scene).
 - Go straight to the **next/previous drawing** from Maya, and let InkIt drive or follow playback so review stays in lockstep.
-- Safe by default: sync starts **off** on every launch and is enabled only when you turn it on.
+- Sync starts **off** on every launch and is enabled only when you turn it on.
 
 ### Export & share
 - Export the annotated video as **MP4 / MOV** (H.264 + AAC) with your strokes burned in — option to include or exclude the audio track.
 - Export stills/boards as **PNG / JPG / BMP**.
+- use autosave files to share/or get back to, incase you forgot to save, it's stroke based saves.
 - The last export folder is remembered, so round-trips are quick.
 
 ### Organize your shots
