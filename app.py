@@ -523,6 +523,8 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "next_frame": "Right",
     "prev_drawing": "Down",
     "next_drawing": "Up",
+    "prev_shot": "Alt+Up",
+    "next_shot": "Alt+Down",
     "toggle_loop": "L",
     # -- Pen colors ----------------------------------------------------
     "pen_color_1": "1",
@@ -560,6 +562,8 @@ ACTION_LABELS: dict[str, str] = {
     "next_frame": "Next frame",
     "prev_drawing": "Previous drawing",
     "next_drawing": "Next drawing",
+    "prev_shot": "Previous shot",
+    "next_shot": "Next shot",
     "toggle_loop": "Loop playback",
     "pen_color_1": "Pen color 1",
     "pen_color_2": "Pen color 2",
@@ -597,6 +601,8 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "next_frame": "Step one frame forward",
     "prev_drawing": "Jump to the previous drawing",
     "next_drawing": "Jump to the next drawing",
+    "prev_shot": "Go to the previous shot in the shot list",
+    "next_shot": "Go to the next shot in the shot list",
     "toggle_loop": "Loop playback at the end",
     "pen_color_1": "Switch to pen color slot 1",
     "pen_color_2": "Switch to pen color slot 2",
@@ -2465,6 +2471,26 @@ def make_tool_icon(kind: str, on: bool = True) -> QIcon:
         p.setPen(QPen(QColor("#1a1a1c"), 1.2))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(r)
+    elif kind == "shot_prev":
+        # Previous shot: film-strip frame with a left arrow
+        p.drawRect(QRectF(8, 7, 10, 18))
+        p.drawLine(QPointF(19, 11), QPointF(19, 21))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawPolygon([QPointF(24, 14), QPointF(18, 16), QPointF(24, 18)])
+        p.drawRect(QRectF(6, 9, 2, 3))
+        p.drawRect(QRectF(6, 15, 2, 3))
+        p.drawRect(QRectF(6, 21, 2, 3))
+    elif kind == "shot_next":
+        # Next shot: film-strip frame with a right arrow
+        p.drawRect(QRectF(14, 7, 10, 18))
+        p.drawLine(QPointF(13, 11), QPointF(13, 21))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawPolygon([QPointF(8, 14), QPointF(14, 16), QPointF(8, 18)])
+        p.drawRect(QRectF(24, 9, 2, 3))
+        p.drawRect(QRectF(24, 15, 2, 3))
+        p.drawRect(QRectF(24, 21, 2, 3))
     p.end()
     return QIcon(pm)
 
@@ -2549,6 +2575,8 @@ ICON_NAMES: dict[str, str] = {
     "nav_next": "Next frame (>)",
     "nav_prev_dot": "Jump to previous drawing (|<)",
     "nav_next_dot": "Jump to next drawing (>||)",
+    "shot_prev": "Previous shot in the shot list",
+    "shot_next": "Next shot in the shot list",
 }
 
 
@@ -5182,6 +5210,7 @@ class MainWindow(QMainWindow):
         self.queue_index: int = -1
         self.queue_visible = bool(self._settings.get("queue_visible", True))
         self.queue_minimized = bool(self._settings.get("queue_minimized", False))
+        self._prev_minimized = bool(self.queue_minimized)
         # Undo history for redo (per frame: Stroke items or cleared-frame lists)
         self._redo_stack: dict[int, list] = {}
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -5551,6 +5580,20 @@ class MainWindow(QMainWindow):
         self.btn_next_draw.setIconSize(QSize(42, 28))
         self.btn_next_draw.setToolTip("Next drawing")
 
+        # --- [BUTTON] Previous Shot / Clip ---
+        self.btn_prev_shot = self._icon_button(
+            "shot_prev",
+            f"Previous shot — Alt+Up ({self._shot_count_str()})",
+        )
+        self.btn_prev_shot.setFixedSize(34, 34)
+
+        # --- [BUTTON] Next Shot / Clip ---
+        self.btn_next_shot = self._icon_button(
+            "shot_next",
+            f"Next shot — Alt+Down ({self._shot_count_str()})",
+        )
+        self.btn_next_shot.setFixedSize(34, 34)
+
         # --- [BUTTON] Loop Playback Toggle ---
         self.btn_loop = self._icon_button("loop", "Loop playback", checkable=True, highlight=True)
         self.btn_loop.setChecked(True)
@@ -5575,13 +5618,17 @@ class MainWindow(QMainWindow):
         self.btn_next.clicked.connect(lambda: self._step(1))
         self.btn_prev_draw.clicked.connect(self.goto_prev_drawing)
         self.btn_next_draw.clicked.connect(self.goto_next_drawing)
+        self.btn_prev_shot.clicked.connect(self._queue_prev_shot)
+        self.btn_next_shot.clicked.connect(self._queue_next_shot)
         self.btn_play.clicked.connect(self._toggle_play)
 
+        play.addWidget(self.btn_prev_shot)
         play.addWidget(self.btn_prev_draw)
         play.addWidget(self.btn_prev)
         play.addWidget(self.btn_play)
         play.addWidget(self.btn_next)
         play.addWidget(self.btn_next_draw)
+        play.addWidget(self.btn_next_shot)
         play.addWidget(self.btn_loop)
         play.addWidget(self.btn_audio)
 
@@ -5697,6 +5744,8 @@ class MainWindow(QMainWindow):
         self._act("next_frame", lambda: self._step(1))
         self._act("prev_drawing", self.goto_prev_drawing)
         self._act("next_drawing", self.goto_next_drawing)
+        self._act("prev_shot", self._queue_prev_shot)
+        self._act("next_shot", self._queue_next_shot)
         self._act("brush_smaller", self._brush_smaller)
         self._act("brush_larger", self._brush_larger)
         self._act("pick_color", self._pick_screen_color)
@@ -6457,6 +6506,32 @@ class MainWindow(QMainWindow):
             f"Shot {index + 1} / {len(self.queue_paths)}: {Path(path).name}"
         )
 
+    def _queue_next_shot(self) -> None:
+        """Moves to the next shot in the shot list (wraps around)."""
+        if not self.queue_paths:
+            self.statusBar().showMessage("No shots in the shot list")
+            return
+        nxt = self.queue_index + 1
+        if nxt >= len(self.queue_paths):
+            nxt = 0
+        self._queue_open(nxt)
+
+    def _queue_prev_shot(self) -> None:
+        """Moves to the previous shot in the shot list (wraps around)."""
+        if not self.queue_paths:
+            self.statusBar().showMessage("No shots in the shot list")
+            return
+        prv = self.queue_index - 1
+        if prv < 0:
+            prv = len(self.queue_paths) - 1
+        self._queue_open(prv)
+
+    def _shot_count_str(self) -> str:
+        if not self.queue_paths:
+            return "no shots in the list"
+        return f"{self.queue_index + 1} / {len(self.queue_paths)} shots"
+
+
     def _close_clip(self) -> None:
         """Releases any open clip/board/still and restores the empty
         'Drag your videos/images here' drop state."""
@@ -6603,6 +6678,11 @@ class MainWindow(QMainWindow):
             self.btn_q_title.setIcon(QIcon())
             self.btn_q_title.setFixedSize(QSize(64, 26))
             self.btn_q_title.setToolTip("Minimize shot list")
+            # Coming back from the collapsed 32px tab: hand back the saved width
+            # so the panel re-opens to its previous size instead of a sliver.
+            if self._prev_minimized:
+                saved = int(self._settings.get("queue_width", 220) or 220)
+                self._set_splitter_width(saved)
         else:
             self.queue_panel.setFixedWidth(32)
             self._q_vlayout.setContentsMargins(3, 6, 3, 6)
@@ -6614,18 +6694,43 @@ class MainWindow(QMainWindow):
             # Same box as expanded, just flipped 90 degrees
             self.btn_q_title.setFixedSize(QSize(26, 64))
             self.btn_q_title.setToolTip("Expand shot list")
+            # Explicitly re-distribute the splitter so the canvas reclaims all
+            # the width freed by collapsing the panel (a plain setFixedWidth
+            # leaves the splitter handle where it was and the clip stays small).
+            self.queue_panel.setMaximumWidth(32)
+            self.splitter.setSizes([32, max(40, self.splitter.width() - 32)])
+            self.queue_panel.setMaximumWidth(16777215)
         for wdg in (
             self.lbl_queue_count, self.btn_q_add, self.btn_q_open,
             self.btn_q_save, self.btn_q_del, self.btn_q_clear,
             self.btn_q_thumbs, self.queue_list,
         ):
             wdg.setVisible(expanded)
+        # Re-fit the clip into whatever space remains — both when minimized to
+        # the thin tab and when fully removed — so the video fills the freed
+        # width cleanly (keeps the user's zoom/pan, just re-fits the letterbox).
+        try:
+            self.canvas.update()
+        except Exception:
+            pass
 
     def _set_queue_minimized(self, on: bool) -> None:
+        if bool(on) and not self.queue_minimized:
+            # Remember the current expanded width before collapsing, so
+            # re-expanding restores exactly this size (not a default one).
+            self._settings["queue_width"] = int(self.queue_panel.width())
+        self._prev_minimized = bool(self.queue_minimized)
         self.queue_minimized = bool(on)
         self._apply_queue_layout()
         self._settings["queue_minimized"] = self.queue_minimized
         self._schedule_save()
+
+    def _set_splitter_width(self, width: int) -> None:
+        """Sets the shot-list panel to a real pixel width, giving the canvas
+        the remaining space (avoids Qt normalizing oversized sizes down)."""
+        total = self.splitter.width()
+        width = int(min(max(140, width), max(140, total - 40)))
+        self.splitter.setSizes([width, max(40, total - width)])
 
     def _set_queue_visible(self, on: bool) -> None:
         self.queue_visible = bool(on)

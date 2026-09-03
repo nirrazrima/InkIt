@@ -25,6 +25,8 @@ nav_prev.png  |  Previous frame (<)
 nav_next.png  |  Next frame (>)
 nav_prev_dot.png  |  Jump to previous drawing (|<)
 nav_next_dot.png  |  Jump to next drawing (>||)
+shot_prev.png  |  Previous shot in the shot list
+shot_next.png  |  Next shot in the shot list
 
 Painted in code (no icon file): audio volume button,
 pen/eraser size button, onion spin pills, eyedropper pointer.
