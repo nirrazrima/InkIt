@@ -61,7 +61,7 @@ If you are an UI/UX artists and interested in the tool please get in touch to ma
 
 ### Organize your shots
 - A resizable **shot list / queue** panel for staging multiple clips and scenes, with add, open, save, delete, and thumbnail controls for fast switching.
-- Jump straight to the **next / previous shot** with the on-screen buttons or the `Alt+Down` / `Alt+Up` shortcuts — navigation wraps around the list.
+- Jump straight to the **next / previous shot** with the on-screen buttons or the `Alt+Down` / `Alt+Up` shortcuts — at the list's ends the current clip jumps to its last / first frame instead.
 - Load media by drag-and-drop, and double-click an `.inkit` scene to open it.
 
 ### Work your way

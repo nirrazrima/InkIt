@@ -266,6 +266,9 @@ class Project:
         self.strokes: dict[int, list[Stroke]] = {}
         self.scene_path: str | None = None
         self.user_saved: bool = False
+        # Always-visible overlay layer (arcs / tracking marks) drawn on top of
+        # every frame; NOT tied to any specific frame.
+        self.overlay_strokes: list[Stroke] = []
 
     def strokes_at(self, f: int) -> list[Stroke]:
         return self.strokes.setdefault(f, [])
@@ -293,6 +296,7 @@ class Project:
             "width": self.width,
             "height": self.height,
             "strokes": {str(k): [stroke_d(s) for s in v] for k, v in self.strokes.items() if v},
+            "overlay_strokes": [stroke_d(s) for s in self.overlay_strokes],
         }
 
     def load_json(self, data: dict, scene_dir: Path | None = None) -> None:
@@ -326,6 +330,17 @@ class Project:
                 )
                 for s in arr
             ]
+        self.overlay_strokes = [
+            Stroke(
+                color=s["color"],
+                base_width=s["base_width"],
+                eraser=s.get("eraser", False),
+                opacity=float(s.get("opacity", 1.0)),
+                hardness=float(s.get("hardness", 1.0)),
+                points=[Point(pt["x"], pt["y"], pt["p"]) for pt in s["points"]],
+            )
+            for s in data.get("overlay_strokes", [])
+        ]
 
 
 # ===========================================================================
@@ -500,9 +515,11 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "undo": "Ctrl+Z",
     "redo": "Ctrl+Shift+Z",
     "clear_frame": "Delete",
+    "clear_overlay": "Ctrl+Shift+Delete",
     # -- Tools --------------------------------------------------------
     "pen": "B",
     "eraser": "E",
+    "overlay": "Alt+O",
     "brush_smaller": "[",
     "brush_larger": "]",
     "pick_color": "C",
@@ -542,8 +559,10 @@ ACTION_LABELS: dict[str, str] = {
     "undo": "Undo stroke",
     "redo": "Redo stroke",
     "clear_frame": "Clear frame",
+    "clear_overlay": "Clear overlay layer",
     "pen": "Pen ↔ Eraser (toggle)",
     "eraser": "Eraser tool",
+    "overlay": "Overlay layer on/off",
     "brush_smaller": "Smaller brush",
     "brush_larger": "Larger brush",
     "pick_color": "Pick color from screen",
@@ -581,8 +600,10 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "undo": "Undo the last stroke on this frame",
     "redo": "Re-apply the last undone stroke",
     "clear_frame": "Erase all drawings on this frame",
+    "clear_overlay": "Erase all marks on the always-visible overlay layer",
     "pen": "Toggle between pen and eraser — [ and ] resize the brush",
     "eraser": "Select the eraser tool",
+    "overlay": "Toggle the overlay layer — marks stay visible on every frame",
     "brush_smaller": "Decrease brush size",
     "brush_larger": "Increase brush size",
     "pick_color": "Eyedropper — hover anywhere on screen, click to set the pen color",
@@ -613,6 +634,7 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
 # Toolbar/playback buttons linked to their action keys (tooltip + status bar).
 BUTTON_ACTION_KEYS: dict[str, str] = {
     "btn_tool": "pen",
+    "btn_overlay": "overlay",
     "btn_view": "zoom_mode",
     "btn_onion": "onion",
     "btn_picker": "pick_color",
@@ -2462,6 +2484,14 @@ def make_tool_icon(kind: str, on: bool = True) -> QIcon:
             p.setBrush(col)
         p.drawRect(QRectF(6, 18, 8, 8))
         p.drawRect(QRectF(18, 18, 8, 8))
+    elif kind == "overlay":
+        # Always-visible overlay layer: three stacked arcs (persistent ink)
+        c = col if on else QColor("#9aa0a6")
+        p.setBrush(c)
+        p.setPen(QPen(c, 2))
+        p.drawArc(QRectF(6, 7, 20, 11), 0 * 16, 180 * 16)
+        p.drawArc(QRectF(6, 11, 20, 11), 0 * 16, 180 * 16)
+        p.drawArc(QRectF(6, 15, 20, 11), 0 * 16, 180 * 16)
     elif kind == "pip":
         p.drawRect(QRectF(4, 6, 24, 18))
         r = QRectF(16, 14, 10, 8)
@@ -2577,6 +2607,7 @@ ICON_NAMES: dict[str, str] = {
     "nav_next_dot": "Jump to next drawing (>||)",
     "shot_prev": "Previous shot in the shot list",
     "shot_next": "Next shot in the shot list",
+    "overlay": "Overlay layer toggle (always-visible arcs / marks)",
 }
 
 
@@ -2683,6 +2714,7 @@ def default_settings() -> dict:
     """Returns default settings dictionary."""
     return {
         "tool": "pen",
+        "overlay_draw": False,
         "color": "#ff3b30",
         "swatch_colors": list(SWATCH_COLORS_DEFAULT),
         "brush": 6,
@@ -2708,6 +2740,7 @@ def default_settings() -> dict:
         "last_open_dir": "",
         "last_save_dir": "",
         "last_export_dir": "",
+        "queue_side": "left",
         "autosave_dir": "",
         "autosave_autodelete": True,   # Settings ▸ Autosave: purge old autosave files
         "autosave_max_days": 90,       # age threshold in days (1..365), default 3 months
@@ -2857,6 +2890,11 @@ class Canvas(QWidget):
         self._cache_key = None
         self._n_committed = 0                   # Strokes baked into _committed
         self._rendered = 0                      # Points of active stroke already painted
+        self.overlay_draw = False               # When True, new strokes go to the overlay layer
+        self._overlay_img: QImage | None = None  # Cached render of all committed overlay strokes
+        self._overlay_active: QImage | None = None  # Incremental layer for in-progress overlay stroke
+        self._overlay_n = 0                     # Overlay strokes baked into _overlay_img
+        self._overlay_rendered = 0              # Points of active overlay stroke already painted
         self._ghost_cache: dict = {}            # LRU {frame: (QImage, sig)} for onion ghosts
         self._ghost_gkey = None                 # invalidation key for _ghost_cache
         self._resize_suppress = False           # live-resize: reuse last stroke cache
@@ -2979,28 +3017,64 @@ class Canvas(QWidget):
         """Paints only the newly added points of the in-progress stroke (incremental)."""
         if not self._drawing or self._stroke is None:
             return
-        if self._active is None or self._active.size() != self.size():
-            img = QImage(self.size(), QImage.Format.Format_ARGB32_Premultiplied)
-            img.fill(Qt.GlobalColor.transparent)
-            self._active = img
-            self._rendered = 0
+        if self.overlay_draw:
+            if self._overlay_active is None or self._overlay_active.size() != self.size():
+                img = QImage(self.size(), QImage.Format.Format_ARGB32_Premultiplied)
+                img.fill(Qt.GlobalColor.transparent)
+                self._overlay_active = img
+                self._overlay_rendered = 0
+            rendered = self._overlay_rendered
+            target = self._overlay_active
+        else:
+            if self._active is None or self._active.size() != self.size():
+                img = QImage(self.size(), QImage.Format.Format_ARGB32_Premultiplied)
+                img.fill(Qt.GlobalColor.transparent)
+                self._active = img
+                self._rendered = 0
+            rendered = self._rendered
+            target = self._active
         pts = self._stroke.points
-        if self._rendered >= len(pts):
+        if rendered >= len(pts):
             return
-        p = QPainter(self._active)
+        p = QPainter(target)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, bool(getattr(self, "antialias", True)))
         if self._stroke.eraser:
             p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            self._stroke_geometry(p, self._stroke, self._dst, QColor(0, 0, 0, 255), seg_from=self._rendered)
+            self._stroke_geometry(p, self._stroke, self._dst, QColor(0, 0, 0, 255), seg_from=rendered)
         elif float(getattr(self._stroke, "hardness", 1.0)) < 0.995:
             p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Lighten)
-            self._soft_stroke(p, self._stroke, self._dst, QColor(self._stroke.color), seg_from=self._rendered)
+            self._soft_stroke(p, self._stroke, self._dst, QColor(self._stroke.color), seg_from=rendered)
         else:
             col = QColor(self._stroke.color)
             col.setAlpha(255)
-            self._stroke_geometry(p, self._stroke, self._dst, col, seg_from=self._rendered)
+            self._stroke_geometry(p, self._stroke, self._dst, col, seg_from=rendered)
         p.end()
-        self._rendered = len(pts)
+        if self.overlay_draw:
+            self._overlay_rendered = len(pts)
+        else:
+            self._rendered = len(pts)
+
+    def _ensure_overlay_cache(self) -> None:
+        """Renders all committed overlay strokes into _overlay_img (always-visible layer)."""
+        sz = self.size()
+        if sz.width() <= 0 or sz.height() <= 0:
+            self._overlay_img = None
+            return
+        strokes = self.project.overlay_strokes
+        total = len(strokes)
+        if self._overlay_img is None or self._overlay_img.size() != sz or self._overlay_n != total:
+            img = QImage(sz, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(Qt.GlobalColor.transparent)
+            ip = QPainter(img)
+            ip.setRenderHint(QPainter.RenderHint.Antialiasing, bool(getattr(self, "antialias", True)))
+            for s in strokes:
+                if s is self._stroke and self._drawing:
+                    continue  # in-progress overlay stroke lives in _overlay_active
+                self._paint_stroke(ip, s, self._dst)
+            ip.end()
+            self._overlay_img = img
+            self._overlay_n = total
+
 
     def _fit(self) -> QRectF:
         """Calculates letterboxed rectangle preserving media aspect ratio, with zoom/pan applied."""
@@ -3121,6 +3195,19 @@ class Canvas(QWidget):
             # feedback; the accurate cache rebuild runs once the resize settles.
             p.setOpacity(self.notes_opacity)
             p.drawImage(self.rect(), self._committed)
+
+        # Always-visible overlay layer (arcs / tracking marks): drawn on top of
+        # the current frame's notes, independent of which frame is shown.
+        if self.project is not None and (self.project.overlay_strokes or self.overlay_draw):
+            self._ensure_overlay_cache()
+            self._ensure_active()
+            p.setOpacity(self.notes_opacity)
+            if self._overlay_img is not None:
+                p.drawImage(0, 0, self._overlay_img)
+            if self._overlay_active is not None and self._drawing and self._stroke is not None and self.overlay_draw:
+                p.setOpacity(self.notes_opacity * min(max(self._stroke.opacity, 0.0), 1.0))
+                p.drawImage(0, 0, self._overlay_active)
+            p.setOpacity(1.0)
 
         # Frame counter HUD (screen-only; never part of exports)
         self._draw_frame_hud(p)
@@ -3421,9 +3508,17 @@ class Canvas(QWidget):
             points=[Point(n.x(), n.y(), pressure)],
         )
         self.project.strokes_at(self.current_frame).append(self._stroke)
+        if self.overlay_draw:
+            # Overlay strokes live in a frame-independent layer
+            self.project.strokes_at(self.current_frame).remove(self._stroke)
+            if not self.project.strokes.get(self.current_frame):
+                self.project.strokes.pop(self.current_frame, None)
+            self.project.overlay_strokes.append(self._stroke)
+            self._overlay_active = None
         self._dst = self._fit()
         self._active = None
         self._rendered = 0
+        self._overlay_rendered = 0
         self._smooth_pos = QPointF(n.x(), n.y())
         self._ensure_active()
         self._push_draw_cursor()
@@ -3473,22 +3568,33 @@ class Canvas(QWidget):
         self._drawing = False
         self._stroke = None
         self._smooth_pos = None
-        if s is not None and self._committed is not None:
-            cp = QPainter(self._committed)
-            if s.eraser:
-                # Clear exactly the eraser geometry; compositing the transparent
-                # active layer with CompositionMode_Clear would wipe the whole
-                # committed cache (Clear ignores source alpha).
-                cp.setRenderHint(QPainter.RenderHint.Antialiasing, bool(getattr(self, "antialias", True)))
-                cp.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-                self._stroke_geometry(cp, s, self._dst, QColor(0, 0, 0, 255))
-            elif self._active is not None:
-                cp.setOpacity(min(max(float(s.opacity), 0.0), 1.0))
-                cp.drawImage(0, 0, self._active)
-            cp.end()
-            self._n_committed += 1
+        if s is not None:
+            if self.overlay_draw:
+                # Full rebuild of the always-visible layer (few strokes, cheap)
+                # keeps count/skip logic simple and correct.
+                self._overlay_img = None
+                self._overlay_n = 0
+                self._overlay_active = None
+                self._overlay_rendered = 0
+                self._ensure_overlay_cache()
+            elif self._committed is not None:
+                cp = QPainter(self._committed)
+                if s.eraser:
+                    # Clear exactly the eraser geometry; compositing the transparent
+                    # active layer with CompositionMode_Clear would wipe the whole
+                    # committed cache (Clear ignores source alpha).
+                    cp.setRenderHint(QPainter.RenderHint.Antialiasing, bool(getattr(self, "antialias", True)))
+                    cp.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+                    self._stroke_geometry(cp, s, self._dst, QColor(0, 0, 0, 255))
+                elif self._active is not None:
+                    cp.setOpacity(min(max(float(s.opacity), 0.0), 1.0))
+                    cp.drawImage(0, 0, self._active)
+                cp.end()
+                self._n_committed += 1
         self._active = None
+        self._overlay_active = None
         self._rendered = 0
+        self._overlay_rendered = 0
         self.strokeFinished.emit()
 
     # -----------------------------------------------------------------------
@@ -3935,7 +4041,7 @@ class ExportWorker(QThread):
     failed = Signal(str)
     finished_ok = Signal(str)
 
-    def __init__(self, video_path: str, project: Project, dest: str, export_audio: bool = True, antialias: bool = True, strokes_snapshot: dict | None = None, clip_opacity: float = 1.0, fade_color: str = "#ffffff", notes_opacity: float = 1.0) -> None:
+    def __init__(self, video_path: str, project: Project, dest: str, export_audio: bool = True, antialias: bool = True, strokes_snapshot: dict | None = None, overlay_snapshot: list | None = None, clip_opacity: float = 1.0, fade_color: str = "#ffffff", notes_opacity: float = 1.0) -> None:
         super().__init__()
         self.video_path = video_path
         self.project = project
@@ -3943,6 +4049,7 @@ class ExportWorker(QThread):
         self.export_audio = export_audio
         self.antialias = antialias
         self._strokes_snapshot = strokes_snapshot
+        self._overlay_snapshot = overlay_snapshot
         self.clip_opacity = float(max(0.0, min(1.0, clip_opacity)))
         self.fade_color = str(fade_color or "#ffffff")
         self.notes_opacity = float(max(0.0, min(1.0, notes_opacity)))
@@ -3996,6 +4103,9 @@ class ExportWorker(QThread):
                 strokes = self._strokes_snapshot.get(i, []) if self._strokes_snapshot is not None else self.project.strokes.get(i, [])
                 if strokes:
                     frame = render_annotations_on_bgr(frame, strokes, antialias=self.antialias, notes_opacity=self.notes_opacity)
+                overlay = self._overlay_snapshot if self._overlay_snapshot is not None else self.project.overlay_strokes
+                if overlay:
+                    frame = render_annotations_on_bgr(frame, overlay, antialias=self.antialias, notes_opacity=self.notes_opacity)
                 proc.stdin.write(np.ascontiguousarray(frame).tobytes())
                 i += 1
                 self.progress.emit(min(99, 1 + int(i / max(total, 1) * 98)))
@@ -4591,7 +4701,10 @@ class PipWindow(QWidget):
             hardness=float(getattr(cv, "hardness", 1.0)),
             points=[Point(n.x(), n.y(), pressure)],
         )
-        mw.project.strokes_at(int(cv.current_frame)).append(self._stroke)
+        if getattr(cv, "overlay_draw", False):
+            mw.project.overlay_strokes.append(self._stroke)
+        else:
+            mw.project.strokes_at(int(cv.current_frame)).append(self._stroke)
         self._active = None
         self._n_rend = 0
 
@@ -4771,6 +4884,17 @@ class PipWindow(QWidget):
                 elif ink is not None:
                     p.setOpacity(op)
                     p.drawImage(0, 0, ink)
+            # Always-visible overlay layer, drawn on top of the current frame's ink
+            overlay = mw.project.overlay_strokes
+            if overlay and bool(getattr(cv, "notes_visible", True)):
+                shim = _PipPaintShim(QRectF(0, 0, pm.width(), pm.height()),
+                                     self._media_size()[0], self._media_size()[1])
+                p.setOpacity(float(min(max(float(getattr(cv, "notes_opacity", 1.0)), 0.0), 1.0)))
+                for s in overlay:
+                    if not s.points:
+                        continue
+                    Canvas._paint_stroke(shim, p, s, QRectF(0, 0, pm.width(), pm.height()))
+                p.setOpacity(1.0)
         finally:
             p.end()
         # Drawings must never vanish from the PiP: if the pip's own stroke
@@ -5210,9 +5334,13 @@ class MainWindow(QMainWindow):
         self.queue_index: int = -1
         self.queue_visible = bool(self._settings.get("queue_visible", True))
         self.queue_minimized = bool(self._settings.get("queue_minimized", False))
+        self.queue_side = str(self._settings.get("queue_side", "left"))
+        if self.queue_side not in ("left", "right"):
+            self.queue_side = "left"
         self._prev_minimized = bool(self.queue_minimized)
         # Undo history for redo (per frame: Stroke items or cleared-frame lists)
         self._redo_stack: dict[int, list] = {}
+        self._redo_overlay: list = []
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.canvas.strokeFinished.connect(self._on_stroke_finished)
         self.canvas.strokeFinished.connect(self._invalidate_redo)
@@ -5361,16 +5489,18 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # [QUEUE] Left-side shot queue panel (user-resizable) + canvas viewport
+        # [QUEUE] Shot queue panel (user-resizable, side configurable) + canvas
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
         self.queue_panel = self._build_queue_panel()
         self.queue_panel.setMinimumWidth(140)
+        self.queue_panel.installEventFilter(self)  # right-click side switcher
         self.splitter.addWidget(self.queue_panel)
         self.splitter.addWidget(self.canvas)
         self.splitter.setStretchFactor(1, 1)
+        self._apply_queue_side()
         saved_w = int(self._settings.get("queue_width", 220) or 220)
-        self.splitter.setSizes([max(140, saved_w), 10000])
+        self.splitter.setSizes(self._splitter_sizes(saved_w))
         self.splitter.splitterMoved.connect(self._queue_split_moved)
         layout.addWidget(self.splitter, 1)
         self._apply_queue_layout()
@@ -5435,6 +5565,21 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.btn_color)
         bar.addWidget(self.btn_picker)
         bar.addWidget(self.btn_tool)
+
+        # --- [BUTTON] Overlay Layer Toggle — always-visible marks/arcs ---
+        # When ON, new strokes are drawn to a layer that persists across all
+        # frames instead of the current frame. Toggle off to annotate frames.
+        self.btn_overlay = self._icon_button(
+            "overlay",
+            "Overlay layer — draw marks that stay visible on every frame "
+            "(tracking arcs). Toggle off to draw on the current frame instead.",
+            checkable=True, highlight=True,
+        )
+        self.btn_overlay.setChecked(bool(getattr(self.canvas, "overlay_draw", False)))
+        self.btn_overlay.toggled.connect(self._toggle_overlay)
+        self.btn_overlay.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.btn_overlay.customContextMenuRequested.connect(self._overlay_context_menu)
+        bar.addWidget(self.btn_overlay)
 
         # --- [BOXES] Brush Hardness (top row) + Pen Opacity (middle) + Lazy Mouse (bottom) ---
         self.sl_hard = BoxSlider("Hardness", 0, 100, 100, "%", icon="hardness")
@@ -5583,14 +5728,14 @@ class MainWindow(QMainWindow):
         # --- [BUTTON] Previous Shot / Clip ---
         self.btn_prev_shot = self._icon_button(
             "shot_prev",
-            f"Previous shot — Alt+Up ({self._shot_count_str()})",
+            f"Previous shot (start of clip at first) — Alt+Up ({self._shot_count_str()})",
         )
         self.btn_prev_shot.setFixedSize(34, 34)
 
         # --- [BUTTON] Next Shot / Clip ---
         self.btn_next_shot = self._icon_button(
             "shot_next",
-            f"Next shot — Alt+Down ({self._shot_count_str()})",
+            f"Next shot (end of clip at last) — Alt+Down ({self._shot_count_str()})",
         )
         self.btn_next_shot.setFixedSize(34, 34)
 
@@ -5720,6 +5865,10 @@ class MainWindow(QMainWindow):
         edit.addAction(self._act("undo", self.undo_stroke))
         edit.addAction(self._act("redo", self.redo_stroke))
         edit.addAction(self._act("clear_frame", self._clear_frame))
+        ovl_clear = self._act("clear_overlay", self._clear_overlay)
+        edit.addAction(ovl_clear)
+        ovl_clear.setEnabled(bool(self.project is not None and self.project.overlay_strokes))
+        self._ovl_clear_action = ovl_clear
         edit.addSeparator()
 
         view = m.addMenu("View")
@@ -5739,6 +5888,7 @@ class MainWindow(QMainWindow):
 
         self._act("pen", self._toggle_tool)  # B toggles pen <-> eraser
         self._act("eraser", lambda: self._set_tool("eraser"))
+        self._act("overlay", self._shortcut_toggle_overlay)
         self._act("play_pause", self._toggle_play)
         self._act("prev_frame", lambda: self._step(-1))
         self._act("next_frame", lambda: self._step(1))
@@ -5845,6 +5995,54 @@ class MainWindow(QMainWindow):
 
     def _toggle_tool(self) -> None:
         self._set_tool("eraser" if self.canvas.tool == "pen" else "pen")
+
+    def _toggle_overlay(self, on: bool) -> None:
+        """Switches strokes between the always-visible overlay layer and the
+        current frame. Activating passes the current pen color/width."""
+        self.canvas.overlay_draw = bool(on)
+        self.canvas.update()
+        if not self._loading_settings:
+            self._settings["overlay_draw"] = on
+            self._schedule_save()
+        if on:
+            self.statusBar().showMessage("Overlay layer ON — marks stay visible on every frame")
+        else:
+            self.statusBar().showMessage("Drawing on the current frame")
+
+    def _shortcut_toggle_overlay(self) -> None:
+        self.btn_overlay.setChecked(not self.btn_overlay.isChecked())
+
+    def _overlay_context_menu(self, pos) -> None:
+        """Right-click menu on the overlay button: clear the always-visible
+        overlay layer."""
+        menu = QMenu(self)
+        act = menu.addAction("Toggle overlay layer")
+        act.setCheckable(True)
+        act.setChecked(bool(self.canvas.overlay_draw))
+        act.triggered.connect(self._shortcut_toggle_overlay)
+        menu.addSeparator()
+        clear_act = menu.addAction("Clear overlay layer")
+        clear_act.setEnabled(bool(self.project is not None and self.project.overlay_strokes))
+        chosen = menu.exec(self.btn_overlay.mapToGlobal(pos))
+        if chosen == clear_act:
+            self._clear_overlay()
+
+    def _clear_overlay(self) -> None:
+        """Erases every mark on the always-visible overlay layer."""
+        if self.project is None:
+            return
+        if not self.project.overlay_strokes:
+            return
+        self.project.overlay_strokes.clear()
+        self.canvas._overlay_img = None
+        self.canvas._overlay_n = 0
+        self.canvas._overlay_active = None
+        self.canvas._overlay_rendered = 0
+        self.canvas.update()
+        self.project.user_saved = False
+        if hasattr(self, "_ovl_clear_action"):
+            self._ovl_clear_action.setEnabled(False)
+        self.statusBar().showMessage("Overlay layer cleared")
 
     def _toggle_view_btn(self) -> None:
         """Z / X shortcuts toggle the combined View nav button."""
@@ -6022,6 +6220,14 @@ class MainWindow(QMainWindow):
         self._autosave_timer.start(250)
 
     def undo_stroke(self) -> None:
+        if self.canvas.overlay_draw and self.project.overlay_strokes:
+            self._redo_overlay.append(self.project.overlay_strokes.pop())
+            self.canvas._overlay_img = None
+            self.canvas._overlay_n = 0
+            self.canvas.update()
+            self._refresh_marks()
+            self._autosave_timer.start(250)
+            return
         strokes = self.project.strokes_at(self.canvas.current_frame)
         if strokes:
             self._redo_stack.setdefault(self.canvas.current_frame, []).append(strokes.pop())
@@ -6030,7 +6236,16 @@ class MainWindow(QMainWindow):
             self._autosave_timer.start(250)
 
     def redo_stroke(self) -> None:
-        """Restores the last undone stroke (or whole cleared frame) on this frame."""
+        """Restores the last undone stroke (or whole cleared frame) on this frame,
+        or the last undone overlay mark."""
+        if self.canvas.overlay_draw and self._redo_overlay:
+            self.project.overlay_strokes.append(self._redo_overlay.pop())
+            self.canvas._overlay_img = None
+            self.canvas._overlay_n = 0
+            self.canvas.update()
+            self._refresh_marks()
+            self._autosave_timer.start(250)
+            return
         stack = self._redo_stack.get(self.canvas.current_frame)
         if not stack:
             return
@@ -6044,8 +6259,11 @@ class MainWindow(QMainWindow):
         self._autosave_timer.start(250)
 
     def _invalidate_redo(self) -> None:
-        """New stroke invalidates redo history for that frame."""
-        self._redo_stack.pop(self.canvas.current_frame, None)
+        """New stroke invalidates redo history for that frame (or the overlay)."""
+        if self.canvas.overlay_draw:
+            self._redo_overlay.clear()
+        else:
+            self._redo_stack.pop(self.canvas.current_frame, None)
 
     def _bind_new_project(self, path: str, count: int, fps: float, w: int, h: int, keep_strokes: dict | None = None) -> None:
         # Stash the outgoing media's drawings so switching shots never loses them
@@ -6056,6 +6274,7 @@ class MainWindow(QMainWindow):
         if keep_strokes is None:
             self.project = Project()
         self._redo_stack = {}
+        self._redo_overlay = []
         self.project.path = path
         self.project.fps = fps
         self.project.frame_count = max(count, 1)
@@ -6434,7 +6653,10 @@ class MainWindow(QMainWindow):
         self._queue_refresh()
 
     def _queue_split_moved(self, pos: int, _index: int) -> None:
-        self._settings["queue_width"] = int(pos)
+        if self.queue_side == "right":
+            self._settings["queue_width"] = int(max(0, self.splitter.width() - pos))
+        else:
+            self._settings["queue_width"] = int(pos)
         self._schedule_save()
 
     def _make_thumb(self, path: str) -> QIcon:
@@ -6506,25 +6728,41 @@ class MainWindow(QMainWindow):
             f"Shot {index + 1} / {len(self.queue_paths)}: {Path(path).name}"
         )
 
+    def _clip_open(self) -> bool:
+        """True when a video, still image, or drawing board is in the viewport."""
+        if getattr(self.canvas, "is_board", False):
+            return True
+        if getattr(self, "_is_still", False) and getattr(self, "_still_bgr", None) is not None:
+            return True
+        return self.reader.cap is not None
+
     def _queue_next_shot(self) -> None:
-        """Moves to the next shot in the shot list (wraps around)."""
-        if not self.queue_paths:
+        """Moves to the next shot in the shot list; with no next shot
+        (end of list or empty list), pauses at the end of the current clip."""
+        if self.queue_paths and self.queue_index + 1 < len(self.queue_paths):
+            self._queue_open(self.queue_index + 1)
+            return
+        if not self._clip_open():
             self.statusBar().showMessage("No shots in the shot list")
             return
-        nxt = self.queue_index + 1
-        if nxt >= len(self.queue_paths):
-            nxt = 0
-        self._queue_open(nxt)
+        if self.playing:
+            self._toggle_play()  # pause so the end frame stays on screen
+        self._show_frame(max(self.project.frame_count - 1, 0))
+        self.statusBar().showMessage("No next shot — end of clip")
 
     def _queue_prev_shot(self) -> None:
-        """Moves to the previous shot in the shot list (wraps around)."""
-        if not self.queue_paths:
+        """Moves to the previous shot in the shot list; with no previous shot
+        (start of list or empty list), pauses at the start of the current clip."""
+        if self.queue_paths and self.queue_index - 1 >= 0:
+            self._queue_open(self.queue_index - 1)
+            return
+        if not self._clip_open():
             self.statusBar().showMessage("No shots in the shot list")
             return
-        prv = self.queue_index - 1
-        if prv < 0:
-            prv = len(self.queue_paths) - 1
-        self._queue_open(prv)
+        if self.playing:
+            self._toggle_play()  # pause so the first frame stays on screen
+        self._show_frame(0)
+        self.statusBar().showMessage("No previous shot — start of clip")
 
     def _shot_count_str(self) -> str:
         if not self.queue_paths:
@@ -6550,6 +6788,8 @@ class MainWindow(QMainWindow):
                 pass
         self.reader.close()
         self.project = Project()
+        self._redo_stack = {}
+        self._redo_overlay = []
         self.canvas.project = self.project
         self.canvas.is_board = False
         self.canvas.set_frame_image(None)
@@ -6558,6 +6798,7 @@ class MainWindow(QMainWindow):
         self._is_still = False
         self._still_bgr = None
         self._redo_stack = {}
+        self._redo_overlay = []
         self.slider.blockSignals(True)
         self.slider.setEnabled(False)
         self.slider.setRange(0, 0)
@@ -6605,6 +6846,11 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction("Open list…", self._queue_open_list)
         m.addAction("Save list…", self._queue_save_list)
+        m.addSeparator()
+        if self.queue_side == "left":
+            m.addAction("Move Right", lambda: self._set_queue_side("right"))
+        else:
+            m.addAction("Move Left", lambda: self._set_queue_side("left"))
         return m
 
     def _show_queue_menu(self, pos) -> None:
@@ -6698,7 +6944,7 @@ class MainWindow(QMainWindow):
             # the width freed by collapsing the panel (a plain setFixedWidth
             # leaves the splitter handle where it was and the clip stays small).
             self.queue_panel.setMaximumWidth(32)
-            self.splitter.setSizes([32, max(40, self.splitter.width() - 32)])
+            self.splitter.setSizes(self._splitter_sizes(32, minimum=32))
             self.queue_panel.setMaximumWidth(16777215)
         for wdg in (
             self.lbl_queue_count, self.btn_q_add, self.btn_q_open,
@@ -6725,12 +6971,54 @@ class MainWindow(QMainWindow):
         self._settings["queue_minimized"] = self.queue_minimized
         self._schedule_save()
 
+    def _apply_queue_side(self) -> None:
+        """Reorders the splitter so the shot list sits left or right of the
+        canvas, matching self.queue_side, and keeps the canvas stretchy."""
+        if self.queue_side == "right":
+            self.splitter.insertWidget(0, self.canvas)
+            self.splitter.insertWidget(1, self.queue_panel)
+            self.splitter.setStretchFactor(0, 1)
+            self.splitter.setStretchFactor(1, 0)
+        else:
+            self.splitter.insertWidget(0, self.queue_panel)
+            self.splitter.insertWidget(1, self.canvas)
+            self.splitter.setStretchFactor(0, 0)
+            self.splitter.setStretchFactor(1, 1)
+        self._apply_queue_layout()
+
+    def _splitter_sizes(self, queue_w: int, minimum: int = 140) -> list:
+        """Splitter pixel sizes in widget order for a given shot-list width."""
+        total = self.splitter.width()
+        queue_w = int(min(max(minimum, queue_w), max(minimum, total - 40)))
+        rest = max(40, total - queue_w)
+        if self.queue_side == "right":
+            return [rest, queue_w]
+        return [queue_w, rest]
+
     def _set_splitter_width(self, width: int) -> None:
         """Sets the shot-list panel to a real pixel width, giving the canvas
         the remaining space (avoids Qt normalizing oversized sizes down)."""
-        total = self.splitter.width()
-        width = int(min(max(140, width), max(140, total - 40)))
-        self.splitter.setSizes([width, max(40, total - width)])
+        self.splitter.setSizes(self._splitter_sizes(width))
+
+    def _set_queue_side(self, side: str) -> None:
+        """Moves the shot list to the left or right of the screen."""
+        side = side if side in ("left", "right") else "left"
+        if side == self.queue_side:
+            return
+        self.queue_side = side
+        self._apply_queue_side()
+        self._settings["queue_side"] = side
+        self._schedule_save()
+
+    def _queue_panel_context_menu(self, ev) -> None:
+        """Right-click on the shot-list background: move the panel to the
+        other side (only the relevant direction is offered)."""
+        menu = QMenu(self)
+        if self.queue_side == "left":
+            menu.addAction("Move Right", lambda: self._set_queue_side("right"))
+        else:
+            menu.addAction("Move Left", lambda: self._set_queue_side("left"))
+        menu.exec(ev.globalPos())
 
     def _set_queue_visible(self, on: bool) -> None:
         self.queue_visible = bool(on)
@@ -7986,6 +8274,7 @@ Start-Sleep -Milliseconds 80
         self.canvas._end()
         # Snapshot strokes for the worker to avoid cross-thread dict access
         strokes_snapshot = {f: list(strokes) for f, strokes in self.project.strokes.items()}
+        overlay_snapshot = list(self.project.overlay_strokes)
         self._progress = QProgressDialog("Exporting…", "Hide", 0, 100, self)
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._progress.setMinimumDuration(0)
@@ -7993,6 +8282,7 @@ Start-Sleep -Milliseconds 80
             self.project.path, self.project, path,
             export_audio=self.export_audio, antialias=bool(self.canvas.antialias),
             strokes_snapshot=strokes_snapshot,
+            overlay_snapshot=overlay_snapshot,
             clip_opacity=float(getattr(self.canvas, "clip_opacity", 1.0)),
             fade_color=str(getattr(self.canvas, "fade_color", QColor("#ffffff")).name(QColor.NameFormat.HexRgb)) if hasattr(getattr(self.canvas, "fade_color", None), "name") else str(getattr(self.canvas, "fade_color", "#ffffff")),
             notes_opacity=float(getattr(self.canvas, "notes_opacity", 1.0)),
@@ -8030,6 +8320,12 @@ Start-Sleep -Milliseconds 80
             antialias=bool(self.canvas.antialias),
             notes_opacity=float(getattr(self.canvas, "notes_opacity", 1.0)),
         )
+        if self.project.overlay_strokes:
+            out = render_annotations_on_bgr(
+                out, self.project.overlay_strokes,
+                antialias=bool(self.canvas.antialias),
+                notes_opacity=float(getattr(self.canvas, "notes_opacity", 1.0)),
+            )
         ok = cv2.imwrite(path, out)
         if not ok:
             QMessageBox.critical(self, "Export failed", f"Could not write:\n{path}")
@@ -8109,6 +8405,8 @@ Start-Sleep -Milliseconds 80
         self._settings["time_mode"] = self.time_mode
         self._settings["queue_visible"] = bool(getattr(self, "queue_visible", True))
         self._settings["queue_minimized"] = bool(getattr(self, "queue_minimized", False))
+        side = getattr(self, "queue_side", "left")
+        self._settings["queue_side"] = side if side in ("left", "right") else "left"
 
     def _write_app_settings(self) -> None:
         self._snapshot_tools()
@@ -8168,6 +8466,8 @@ Start-Sleep -Milliseconds 80
         self.canvas.notes_visible = vis
         self.btn_hide.setIcon(make_tool_icon("eye", vis))
         self._set_tool(s.get("tool", "pen") if s.get("tool") in ("pen", "eraser") else "pen")
+        self.canvas.overlay_draw = bool(s.get("overlay_draw", False))
+        self.btn_overlay.setChecked(self.canvas.overlay_draw)
         self.loop = bool(s.get("loop", True))
         self.btn_loop.setChecked(self.loop)
         self.btn_loop.setIcon(make_tool_icon("loop", self.loop))
@@ -8328,6 +8628,18 @@ Start-Sleep -Milliseconds 80
                 elif ev.button() == Qt.MouseButton.RightButton:
                     pk.cancel()
             return True  # swallow — nothing else reacts while picking
+        # Right-click shot list background (not the list rows, which have their
+        # own menu): move the panel between sides
+        qp = getattr(self, "queue_panel", None)
+        ql = getattr(self, "queue_list", None)
+        if (
+            et == QEvent.Type.ContextMenu
+            and qp is not None
+            and obj is not ql
+            and (obj is qp or (isinstance(obj, QWidget) and qp.isAncestorOf(obj)))
+        ):
+            self._queue_panel_context_menu(ev)
+            return True
         if et == QEvent.Type.Enter and obj is not self:
             vis = getattr(obj, "isVisible", None)
             if callable(vis) and not vis():
@@ -8358,7 +8670,7 @@ Start-Sleep -Milliseconds 80
             self.statusBar().clearMessage()
             self._hover_status = False
         lm = getattr(self, "lbl_meta", None)
-        if obj is self.btn_audio:
+        if hasattr(self, "btn_audio") and obj is self.btn_audio:
             t = ev.type()
             if t == QEvent.Type.MouseButtonPress and ev.button() == Qt.MouseButton.LeftButton:
                 self._vol_drag_x = ev.position().x()
@@ -8464,6 +8776,8 @@ Start-Sleep -Milliseconds 80
 
     def _on_stroke_finished(self) -> None:
         self._refresh_marks()
+        if hasattr(self, "_ovl_clear_action"):
+            self._ovl_clear_action.setEnabled(bool(self.project is not None and self.project.overlay_strokes))
         self._autosave_timer.start(250)
 
     def _autosave_notes(self) -> None:
