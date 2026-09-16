@@ -62,7 +62,7 @@ If you are an UI/UX artists and interested in the tool please get in touch to ma
 ### Organize your shots
 - A resizable **shot list / queue** panel for staging multiple clips and scenes, with add, open, save, delete, and thumbnail controls for fast switching.
 - Jump straight to the **next / previous shot** with the on-screen buttons or the `Alt+Down` / `Alt+Up` shortcuts — at the list's ends the current clip jumps to its last / first frame instead.
-- Load media by drag-and-drop, and double-click an `.inkit` scene to open it.
+- Load media by drag-and-drop, and double-click an `.inkit` scene or a video file to open it (choose in **Settings ▸ Files** what a double-click does while InkIt is already running: replace the current clip without touching the shot list, add to the shot list and switch, or open a new window).
 
 ### Work your way
 - Fully **customizable keyboard shortcuts** in the Settings editor — redefine any action to suit your flow.

@@ -160,12 +160,14 @@ from PySide6.QtWidgets import (
     QSplitter,
     QProgressDialog,
     QPushButton,
+    QRadioButton,
     QSizeGrip,
     QSizePolicy,
     QSlider,
     QStackedWidget,
     QAbstractItemView,
     QAbstractSpinBox,
+    QButtonGroup,
     QDoubleSpinBox,
     QFormLayout,
     QSpinBox,
@@ -963,7 +965,7 @@ class PressureCurveEdit(QWidget):
 class SettingsDialog(QDialog):
     """Settings window with a left navigation sidebar and stacked pages."""
 
-    def __init__(self, current: Path, default: Path, cursor: dict | None = None, shortcuts: dict | None = None, parent=None, autodelete: bool = True, max_days: int = 90, onion_opacity: int = 35) -> None:
+    def __init__(self, current: Path, default: Path, cursor: dict | None = None, shortcuts: dict | None = None, parent=None, autodelete: bool = True, max_days: int = 90, onion_opacity: int = 35, open_behavior: str = "replace") -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.resize(660, 540)
@@ -987,7 +989,7 @@ class SettingsDialog(QDialog):
             "QListWidget#settingsNav::item:selected { background: #2a3ec4; color: #ffffff;"
             " border-radius: 3px; }"
         )
-        for title in ("Autosave", "Cursor", "Pen", "Onion Skinning", "Shortcuts"):
+        for title in ("Autosave", "Files", "Cursor", "Pen", "Onion Skinning", "Shortcuts"):
             self._nav.addItem(title)
         body.addWidget(self._nav)
 
@@ -995,6 +997,7 @@ class SettingsDialog(QDialog):
         self._stack = QStackedWidget()
         body.addWidget(self._stack, 1)
         self._stack.addWidget(self._build_autosave_page(current, autodelete, max_days))
+        self._stack.addWidget(self._build_files_page(open_behavior))
         self._stack.addWidget(self._build_cursor_page(cursor))
         self._stack.addWidget(self._build_pen_page(cursor))
         self._stack.addWidget(self._build_onion_page(cursor, onion_opacity))
@@ -1060,6 +1063,56 @@ class SettingsDialog(QDialog):
     def autodelete_settings(self) -> tuple[bool, int]:
         """Returns (enabled, max_age_days) for autosave auto-deletion."""
         return bool(self.autodelete_cb.isChecked()), int(self.days_spin.value())
+
+    def _build_files_page(self, open_behavior: str) -> QWidget:
+        """Opening behavior: what happens when a media file is double-clicked
+        while another InkIt window is already running."""
+        page, fv = self._page()
+        title = QLabel("When double-clicking a media file while InkIt is already open")
+        title.setWordWrap(True)
+        title.setStyleSheet("font-weight: 600;")
+        fv.addWidget(title)
+
+        self.behavior_group = QButtonGroup(self)
+        self._behavior_radios: dict[str, QRadioButton] = {}
+        options = [
+            (
+                "replace",
+                "Replace the current clip",
+                "The clicked video/image replaces what is currently open in this window.",
+            ),
+            (
+                "queue",
+                "Add to shot list & switch",
+                "The file is added to the shot list and becomes the active clip.",
+            ),
+            (
+                "new_instance",
+                "Open a new window",
+                "A new InkIt window opens with the file — multiple windows run side by side.",
+            ),
+        ]
+        for value, label, hint in options:
+            radio = self._behavior_radios[value] = QRadioButton(label)
+            radio.setToolTip(hint)
+            if value == open_behavior:
+                radio.setChecked(True)
+            self.behavior_group.addButton(radio, id=len(self._behavior_radios))
+            fv.addWidget(radio)
+            note = QLabel(hint)
+            note.setWordWrap(True)
+            note.setStyleSheet("color:#888888;")
+            note.setContentsMargins(22, 0, 0, 8)
+            fv.addWidget(note)
+        fv.addStretch(1)
+        return page
+
+    def open_behavior_result(self) -> str:
+        """Returns the selected double-click behavior ('replace', 'queue' or 'new_instance')."""
+        for value, radio in self._behavior_radios.items():
+            if radio.isChecked():
+                return value
+        return "replace"
 
     def _build_cursor_page(self, cursor: dict) -> QWidget:
         page, cv = self._page()
@@ -2741,6 +2794,7 @@ def default_settings() -> dict:
         "last_save_dir": "",
         "last_export_dir": "",
         "queue_side": "left",
+        "open_behavior": "replace",  # double-click while running: replace | queue | new_instance
         "autosave_dir": "",
         "autosave_autodelete": True,   # Settings ▸ Autosave: purge old autosave files
         "autosave_max_days": 90,       # age threshold in days (1..365), default 3 months
@@ -6362,6 +6416,7 @@ class MainWindow(QMainWindow):
             autodelete=bool(self._settings.get("autosave_autodelete", True)),
             max_days=int(self._settings.get("autosave_max_days", 90)),
             onion_opacity=int(self._settings.get("onion_opacity", 35)),
+            open_behavior=str(self._settings.get("open_behavior", "replace")),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             if dlg.deleted:
@@ -6378,6 +6433,7 @@ class MainWindow(QMainWindow):
         ad_on, ad_days = dlg.autodelete_settings()
         self._settings["autosave_autodelete"] = ad_on
         self._settings["autosave_max_days"] = ad_days
+        self._settings["open_behavior"] = dlg.open_behavior_result()
         cs = dlg.cursor_settings()
         aa = dlg.antialias_enabled()
         curve = dlg.pressure_curve()
@@ -6593,6 +6649,20 @@ class MainWindow(QMainWindow):
         self.queue_index = -1
         self._queue_refresh()
         self._queue_open(0)
+
+    def _append_to_queue(self, paths: list[str]) -> None:
+        """Adds files to the shot list (deduped) without opening/switching clips."""
+        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p)]
+        if not fresh:
+            return
+        known = {str(Path(p).resolve()).lower() for p in self.queue_paths}
+        new = [p for p in fresh if str(Path(p).resolve()).lower() not in known]
+        self.queue_paths.extend(new)
+        self._queue_refresh()
+        if new:
+            self.statusBar().showMessage(f"Added {len(new)} shot(s) to the list")
+        else:
+            self.statusBar().showMessage("Already in the list")
 
     def _replace_queue(self, paths: list[str]) -> None:
         """Swaps the whole list (used by Open list) and opens the first entry."""
@@ -6862,7 +6932,7 @@ class MainWindow(QMainWindow):
             "Shots (*.mp4 *.mov *.MP4 *.MOV *.inkit *.json *.png *.jpg *.jpeg *.bmp *.webp);;All files (*.*)",
         )
         if paths:
-            self._set_queue(paths)
+            self._append_to_queue(paths)
 
     def _save_list_file(self, path: str) -> None:
         Path(path).write_text("\n".join(self.queue_paths), encoding="utf-8")
@@ -7229,8 +7299,14 @@ class MainWindow(QMainWindow):
         paths = self._supported_drop_paths(ev)
         if not paths:
             return
-        # Stage every dropped file in the left-side queue and open the first
-        self._set_queue(paths)
+        # Only Explorer double-clicks replace the current clip. Dropping onto
+        # the app never disturbs what is playing: with a clip open the files
+        # are just added to the shot list; on a fresh window the first is
+        # opened for immediate feedback.
+        if self._clip_open():
+            self._append_to_queue(paths)
+        else:
+            self._set_queue(paths)
         ev.acceptProposedAction()
 
     def _show_frame(self, index: int) -> None:
@@ -8870,33 +8946,135 @@ def register_inkit_association() -> None:
         pass
 
 
+def _resolve_open_behavior() -> str:
+    """Reads the saved open-behavior setting (replace | queue | new_instance)."""
+    try:
+        data = json.loads((config_dir() / "settings.json").read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            b = str(data.get("open_behavior", "replace"))
+            if b in ("replace", "queue", "new_instance"):
+                return b
+    except Exception:
+        pass
+    return "replace"
+
+
+def _media_arg_paths() -> list[str]:
+    """Command-line paths InkIt knows how to open (video, image, or scene)."""
+    out: list[str] = []
+    for arg in sys.argv[1:]:
+        p = Path(arg)
+        if p.is_file():
+            low = p.suffix.lower()
+            if low in (".inkit", ".json") or low in (".mp4", ".mov") or _is_image_path(p):
+                out.append(str(p))
+    return out
+
+
+def _open_file_in_window(w: "MainWindow", path: str, behavior: str) -> None:
+    """Opens `path` in MainWindow `w`, honoring the open-behavior setting.
+
+    - "replace": clears the shot list, puts only this file in it, plays it.
+    - "queue": adds the file to the shot list (deduped) and switch to it.
+    - "new_instance": on a fresh window, stages the file in its own list and
+      plays it.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return
+    if behavior == "replace":
+        w._replace_queue([str(p)])
+        return
+    if behavior == "new_instance":
+        w._set_queue([str(p)])
+        return
+    # queue: stage in the shot list and switch to it as the active clip
+    keys = [str(Path(q).resolve()).lower() for q in w.queue_paths]
+    key = str(p.resolve()).lower()
+    if key in keys:
+        idx = keys.index(key)
+    else:
+        w.queue_paths.append(path)
+        w._queue_refresh()
+        idx = len(w.queue_paths) - 1
+    w._queue_open(idx)
+
+
+def _apply_recv_payload(w: "MainWindow", payload: str, fallback_behavior: str = "replace") -> None:
+    """Handles an IPC message from a second instance.
+
+    `payload` is '<behavior>\\x00<path>\\x00<path>…' where <behavior> is the
+    open behavior the sending instance resolved from the current settings.
+    """
+    tokens = [t for t in payload.split("\x00") if t.strip()]
+    bhv = tokens[0] if tokens else fallback_behavior
+    if bhv not in ("replace", "queue", "new_instance"):
+        bhv = fallback_behavior
+    paths = [t.strip() for t in tokens[1:]]
+    if not paths:
+        return
+    if bhv == "replace":
+        # Clear the primary window's list and play only the received file(s)
+        w._replace_queue(paths)
+        return
+    if bhv == "new_instance":
+        w._set_queue(paths)
+        return
+    for path in paths:
+        _open_file_in_window(w, path, "queue")
+
+
 def main() -> None:
     """Application main entry point."""
     app = QApplication(sys.argv)
     app.setApplicationName("InkIt")
     app.setStyle("Fusion")
 
+    behavior = _resolve_open_behavior()
+    arg_paths = _media_arg_paths()
+
     _GUARD = "InkIt-SingleInstance"
+    _single = None
+    _handled_externally = False
     try:
         from PySide6.QtNetwork import QLocalServer, QLocalSocket
-        _probe = QLocalSocket()
-        _probe.connectToServer(_GUARD)
-        if _probe.waitForConnected(300):
+        if behavior != "new_instance":
+            # Single-window modes: hand the file(s) to the running instance if
+            # one is up, otherwise this process becomes the primary instance.
+            _probe = QLocalSocket()
+            _probe.connectToServer(_GUARD)
+            if _probe.waitForConnected(300):
+                try:
+                    # First token = the requested behavior, then the file paths
+                    _probe.write((behavior + "\x00" + "\x00".join(arg_paths)).encode("utf-8"))
+                    _probe.flush()
+                    _probe.waitForBytesWritten(500)
+                    _probe.disconnectFromServer()
+                except Exception:
+                    pass
+                _probe.abort()
+                _handled_externally = True
+            else:
+                _probe.abort()
+                QLocalServer.removeServer(_GUARD)
+                _single = QLocalServer()
+                _single.listen(_GUARD)
+        else:
+            # Multi-window mode: never steal the guard from a running instance —
+            # a second listener simply fails and this process runs on its own.
+            _single = QLocalServer()
             try:
-                _probe.disconnectFromServer()
+                _single.listen(_GUARD)
             except Exception:
-                pass
-            try:
-                print("InkIt is already running.", file=sys.stderr)
-            except Exception:
-                pass
-            sys.exit(0)
-        _probe.abort()
-        QLocalServer.removeServer(_GUARD)
-        _single = QLocalServer()
-        _single.listen(_GUARD)
+                _single = None
     except Exception:
         _single = None
+
+    if _handled_externally:
+        # The file(s) went to the already-running window — this process must
+        # not create a second, empty window.
+        sys.exit(0)
+
     icon = app_icon_path()
     if not icon.is_file():
         try:
@@ -8922,26 +9100,34 @@ def main() -> None:
         except Exception:
             pass
 
+    def _handle_connection() -> None:
+        conn = _single.nextPendingConnection() if _single is not None else None
+        if conn is not None:
+            try:
+                if conn.waitForReadyRead(1500):
+                    payload = bytes(conn.readAll()).decode("utf-8", "replace")
+                    _apply_recv_payload(w, payload, behavior)
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _focus_existing()
+
     if _single is not None:
         try:
-            _single.newConnection.connect(_focus_existing)
+            _single.newConnection.connect(_handle_connection)
         except Exception:
             pass
 
     # No startup board: the window opens on an empty "Drag your video or image
     # here" state until a file is opened or dropped.
-    # Handle files passed via command-line arguments (e.g. double-clicking an .inkit or video)
-    for arg in sys.argv[1:]:
-        p = Path(arg)
-        if p.is_file():
-            low = p.suffix.lower()
-            if low in (".inkit", ".json"):
-                w._open_scene_path(str(p))
-            elif low in (".mp4", ".mov"):
-                w._open_video_path(str(p))
-            elif _is_image_path(p):
-                w._open_image_path(str(p))
-            break
+    # Handle files passed via command-line arguments (e.g. double-clicking an
+    # .inkit or video), unless a running instance already received them.
+    if not _handled_externally:
+        for path in arg_paths:
+            _open_file_in_window(w, path, behavior)
     sys.exit(app.exec())
 
 
