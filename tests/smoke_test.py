@@ -187,18 +187,43 @@ def test_text_notes(w, tmp: Path, qapp) -> None:
     w._set_start_frame(1001)
     w._show_frame(4)
 
+    from PySide6.QtCore import QPoint, Qt as _Qt
+    from PySide6.QtTest import QTest
+    check("add_range_note" not in w._actions, "no separate range-note action")
+    seen: dict = {}
+
     def fill():
         dlg = qapp.activeModalWidget()
+        seen["defaults"] = (dlg.sp_start.value(), dlg.sp_end.value())
         dlg.edit.setPlainText("hold pose two more frames")
-        dlg.sp_end.setValue(1012)
+        box = dlg.sp_end  # click-to-type the end frame
+        QTest.mouseClick(box, _Qt.MouseButton.LeftButton, pos=QPoint(40, 15))
+        box._edit.selectAll()
+        QTest.keyClicks(box._edit, "1012")
+        QTest.keyClick(box._edit, _Qt.Key.Key_Return)
         dlg.accept()
     QTimer.singleShot(50, fill)
-    w.add_text_note(ask_range=True)
+    w.add_text_note()
+    check(seen.get("defaults") == (1005, 1005), f"note dialog defaults From/To to current frame ({seen.get('defaults')})")
     n = w.project.text_notes
     check(len(n) == 1 and n[0]["start"] == 4 and n[0]["end"] == 11, f"range note stored 0-based (1005-1012 -> {n})")
     w.project.text_notes.append({"start": 30, "end": 30, "text": "arc is floaty"})
     w._notes_changed()
     check(w.notes_list.count() == 2 and w.notes_list.item(0).text().startswith("1005–1012"), "sidebar lists notes with display frames")
+    def move():
+        dlg = qapp.activeModalWidget()
+        box = dlg.sp_start  # drag-scrub From +8 frames (4 px/step); To follows
+        QTest.mousePress(box, _Qt.MouseButton.LeftButton, pos=QPoint(30, 15))
+        QTest.mouseMove(box, QPoint(46, 15))
+        QTest.mouseMove(box, QPoint(62, 15))
+        QTest.mouseRelease(box, _Qt.MouseButton.LeftButton, pos=QPoint(62, 15))
+        seen["edit"] = (dlg.sp_start.value(), dlg.sp_end.value())
+        dlg.accept()
+    QTimer.singleShot(50, move)
+    w._edit_text_note(1)
+    check(seen.get("edit") == (1039, 1039) and w.project.text_notes[1]["start"] == 38, f"editing a note changes its frames ({seen.get('edit')})")
+    w.project.text_notes[1].update({"start": 30, "end": 30})
+    w._notes_changed()
     w._notes_jump(w.notes_list.item(1))
     check(w.canvas.current_frame == 30, "click note in sidebar jumps to its frame")
     check([x["text"] for x in w.project.notes_at(8)] == ["hold pose two more frames"], "notes_at covers the range")

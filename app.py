@@ -874,7 +874,6 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "set_fps": "Ctrl+Alt+F",
     "open_sequence": "Ctrl+Alt+O",
     "add_note": "N",
-    "add_range_note": "Shift+N",
     "notes_panel": "Ctrl+Shift+N",
     "export_review": "Ctrl+Shift+R",
     "start_frame": "Ctrl+Shift+F",
@@ -927,7 +926,6 @@ ACTION_LABELS: dict[str, str] = {
     "set_fps": "Frame rate…",
     "open_sequence": "Open image sequence…",
     "add_note": "Add note…",
-    "add_range_note": "Add range note…",
     "notes_panel": "Review Notes panel",
     "export_review": "Export review sheet…",
     "start_frame": "Set start frame…",
@@ -978,8 +976,7 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "export_frames": "Write every drawn / noted frame as PNG plus a contact sheet",
     "set_fps": "Override the playback / export frame rate",
     "open_sequence": "Open a numbered PNG / JPG / EXR / TIFF sequence as a clip",
-    "add_note": "Add a typed note on the current frame",
-    "add_range_note": "Add a typed note spanning a frame range",
+    "add_note": "Add a typed note on the current frame or a frame range",
     "notes_panel": "Show / hide the typed review notes sidebar",
     "export_review": "Export typed notes + drawn frames as CSV and an HTML sheet with thumbnails",
     "start_frame": "Type the first frame number of this clip (e.g. 1001)",
@@ -2696,16 +2693,13 @@ class NoteDialog(QDialog):
         self.setMinimumWidth(420)
         lay = QVBoxLayout(self)
         row = QHBoxLayout()
-        self.sp_start = QSpinBox()
-        self.sp_end = QSpinBox()
-        for sp, v in ((self.sp_start, start), (self.sp_end, end)):
-            sp.setRange(int(first), int(last))
-            sp.setValue(int(v))
-            sp.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-            sp.setFixedWidth(90)
-        row.addWidget(QLabel("Frames"))
+        # Same click-to-type / drag-to-scrub control as the Start frame box
+        self.sp_start = FrameNumberBox("From", int(start), int(first), int(last))
+        self.sp_end = FrameNumberBox("To", int(end), int(first), int(last))
+        for sp in (self.sp_start, self.sp_end):
+            sp.setFixedSize(110, 30)
+            sp.setToolTip("Frame number — click to type, drag left/right to scrub (Shift ×10)")
         row.addWidget(self.sp_start)
-        row.addWidget(QLabel("to"))
         row.addWidget(self.sp_end)
         row.addStretch(1)
         lay.addLayout(row)
@@ -6609,7 +6603,6 @@ class MainWindow(QMainWindow):
         self._ovl_clear_action = ovl_clear
         edit.addSeparator()
         edit.addAction(self._act("add_note", self.add_text_note))
-        edit.addAction(self._act("add_range_note", lambda: self.add_text_note(ask_range=True)))
         edit.addSeparator()
 
         view = m.addMenu("View")
@@ -8353,8 +8346,7 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background:#3c3c3c; } QPushButton:pressed { background:#5285a6; color:white; }"
         )
         for text, tip, slot in (
-            ("+ Note", "Add a note on the current frame [N]", lambda: self.add_text_note()),
-            ("+ Range", "Add a note over a frame range [Shift+N]", lambda: self.add_text_note(ask_range=True)),
+            ("+ Note", "Add a note on this frame or a range [N]", lambda: self.add_text_note()),
             ("Sheet…", "Export review sheet (CSV + HTML with thumbnails)", lambda: self.export_review_sheet()),
         ):
             b = QPushButton(text)
@@ -8453,16 +8445,15 @@ class MainWindow(QMainWindow):
         self.canvas.update()
         self._autosave_timer.start(250)
 
-    def add_text_note(self, ask_range: bool = False) -> None:
-        """Adds a typed note on the current frame (or a range)."""
+    def add_text_note(self) -> None:
+        """Adds a typed note; From/To default to the current frame (edit for a range)."""
         if not self._clip_open():
             self.statusBar().showMessage("Open a clip first")
             return
         start = int(self.project.start_frame)
         last = start + max(self.project.frame_count - 1, 0)
         cur = self.project.display_frame(self.canvas.current_frame)
-        end = min(cur + 10, last) if ask_range else cur
-        dlg = NoteDialog(self, start, last, cur, end, "", "Add range note" if ask_range else "Add note")
+        dlg = NoteDialog(self, start, last, cur, cur, "", "Add note")
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         a, b, text = dlg.result_values()
