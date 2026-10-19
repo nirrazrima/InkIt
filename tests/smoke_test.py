@@ -178,7 +178,56 @@ def test_start_frame(w, tmp: Path, qapp) -> None:
     check("FRAME 1021" in got and "APPFRAME 1021" in got, f"InkIt 1021 sends Maya FRAME/APPFRAME 1021 ({got})")
 
 
-FEATURE_TESTS = [test_frame_accurate_seek, test_start_frame]
+def test_text_notes(w, tmp: Path, qapp) -> None:
+    """Typed notes: add via dialog, sidebar jump, scene round-trip, legacy scene, review sheet."""
+    from PySide6.QtCore import QTimer
+    clip = tmp / "sh030_1001-1047.mp4"
+    make_clip(clip)
+    w._open_video_path(str(clip))
+    w._set_start_frame(1001)
+    w._show_frame(4)
+
+    def fill():
+        dlg = qapp.activeModalWidget()
+        dlg.edit.setPlainText("hold pose two more frames")
+        dlg.sp_end.setValue(1012)
+        dlg.accept()
+    QTimer.singleShot(50, fill)
+    w.add_text_note(ask_range=True)
+    n = w.project.text_notes
+    check(len(n) == 1 and n[0]["start"] == 4 and n[0]["end"] == 11, f"range note stored 0-based (1005-1012 -> {n})")
+    w.project.text_notes.append({"start": 30, "end": 30, "text": "arc is floaty"})
+    w._notes_changed()
+    check(w.notes_list.count() == 2 and w.notes_list.item(0).text().startswith("1005–1012"), "sidebar lists notes with display frames")
+    w._notes_jump(w.notes_list.item(1))
+    check(w.canvas.current_frame == 30, "click note in sidebar jumps to its frame")
+    check([x["text"] for x in w.project.notes_at(8)] == ["hold pose two more frames"], "notes_at covers the range")
+    check(w.slider.note_marks == [(4, 11), (30, 30)], "timeline shows note ranges")
+    w.project.strokes_at(20).append(app.Stroke(color="#00ff00", base_width=8.0, points=[app.Point(0.2, 0.2, 1.0), app.Point(0.8, 0.6, 1.0)]))
+
+    scene = tmp / "sh030.inkit"
+    scene.write_text(json.dumps(w.project.to_json()), encoding="utf-8")
+    w.project.text_notes = []
+    w._open_scene_path(str(scene))
+    check(len(w.project.text_notes) == 2, "typed notes restored from scene")
+    legacy = json.loads(scene.read_text())
+    legacy.pop("text_notes")
+    legacy.pop("start_frame")
+    lp = tmp / "legacy_notes.inkit"
+    lp.write_text(json.dumps(legacy), encoding="utf-8")
+    pr = app.Project()
+    pr.load_json(legacy)
+    check(pr.text_notes == [] and pr.start_frame == 0 and pr.annotated_frames() == [20], "legacy scene (no notes / start) loads")
+
+    out = w.export_review_sheet(str(tmp / "review.html"))
+    html_txt = Path(out).read_text(encoding="utf-8")
+    rows = list(__import__("csv").reader(open(tmp / "review.csv", encoding="utf-8-sig")))
+    check(rows[0][:3] == ["shot", "frame_start", "frame_end"] and len(rows) == 4, f"review CSV has header + 3 rows ({len(rows)})")
+    check(rows[1][1:3] == ["1005", "1012"] and rows[2][1] == "1021" and rows[2][5] == "yes", "CSV uses display frames, drawing-only row included")
+    check(html_txt.count("data:image/jpeg;base64,") == 3 and "arc is floaty" in html_txt, "HTML sheet embeds 3 thumbnails")
+
+
+FEATURE_TESTS = [test_frame_accurate_seek, test_start_frame, test_text_notes]
 
 
 def main() -> int:

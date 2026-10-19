@@ -72,7 +72,10 @@ ARCHITECTURE & COMPONENT MAP:
 
 from __future__ import annotations
 
+import base64
+import csv
 import ctypes
+import html
 import json
 import math
 import os
@@ -146,6 +149,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDockWidget,
     QFileDialog,
     QFrame,
     QGroupBox,
@@ -160,6 +164,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QSplitter,
     QProgressDialog,
     QPushButton,
@@ -277,6 +282,17 @@ class Project:
         # First frame NUMBER shown to the user (0, 1, 1001, 6586, ...). Frames
         # stay 0-based internally; only display / export / Maya use the offset.
         self.start_frame: int = 0
+        # Typed review notes: [{"start": f0, "end": f1, "text": "..."}] with
+        # 0-based inclusive frame range (start == end for a single frame).
+        self.text_notes: list[dict] = []
+
+    def notes_at(self, f: int) -> list[dict]:
+        """Typed notes whose frame range covers frame `f`."""
+        return [n for n in self.text_notes if int(n["start"]) <= int(f) <= int(n["end"])]
+
+    def noted_frames(self) -> list[int]:
+        """First frame of every typed note (timeline markers)."""
+        return sorted({int(n["start"]) for n in self.text_notes})
 
     def display_frame(self, f: int) -> int:
         """User-facing frame number for internal 0-based frame `f`."""
@@ -310,6 +326,10 @@ class Project:
             "strokes": {str(k): [stroke_d(s) for s in v] for k, v in self.strokes.items() if v},
             "overlay_strokes": [stroke_d(s) for s in self.overlay_strokes],
             "start_frame": int(self.start_frame),
+            "text_notes": [
+                {"start": int(n["start"]), "end": int(n["end"]), "text": str(n.get("text", ""))}
+                for n in self.text_notes
+            ],
         }
 
     def load_json(self, data: dict, scene_dir: Path | None = None) -> None:
@@ -333,6 +353,14 @@ class Project:
             self.height = int(data["height"])
         # Older scenes have no start frame: they keep displaying from 0
         self.start_frame = int(data.get("start_frame", 0) or 0)
+        self.text_notes = []
+        for n in data.get("text_notes", []) or []:
+            try:
+                a, b = int(n["start"]), int(n.get("end", n["start"]))
+                self.text_notes.append({"start": min(a, b), "end": max(a, b), "text": str(n.get("text", ""))})
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.text_notes.sort(key=lambda n: (n["start"], n["end"]))
         for k, arr in data.get("strokes", {}).items():
             self.strokes[int(k)] = [
                 Stroke(
@@ -678,6 +706,10 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "queue_panel": "Ctrl+L",
     "time_mode": "Ctrl+T",
     "goto_frame": "Ctrl+G",
+    "add_note": "N",
+    "add_range_note": "Shift+N",
+    "notes_panel": "Ctrl+Shift+N",
+    "export_review": "Ctrl+Shift+R",
     "start_frame": "Ctrl+Shift+F",
     "show_thumbs": "Ctrl+Shift+T",
     "settings": "Ctrl+,",
@@ -722,6 +754,10 @@ ACTION_LABELS: dict[str, str] = {
     "queue_panel": "Shot list",
     "time_mode": "Frames / time display",
     "goto_frame": "Go to frame…",
+    "add_note": "Add note…",
+    "add_range_note": "Add range note…",
+    "notes_panel": "Review Notes panel",
+    "export_review": "Export review sheet…",
     "start_frame": "Set start frame…",
     "show_thumbs": "Show thumbnails",
     "settings": "Settings…",
@@ -765,6 +801,10 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "queue_panel": "Show or hide the shot list panel",
     "time_mode": "Switch timeline between frames and timecode",
     "goto_frame": "Type a frame number to jump to",
+    "add_note": "Add a typed note on the current frame",
+    "add_range_note": "Add a typed note spanning a frame range",
+    "notes_panel": "Show / hide the typed review notes sidebar",
+    "export_review": "Export typed notes + drawn frames as CSV and an HTML sheet with thumbnails",
     "start_frame": "Type the first frame number of this clip (e.g. 1001)",
     "show_thumbs": "Show or hide shot list thumbnails",
     "settings": "Open the settings dialog",
@@ -837,6 +877,7 @@ class TimelineSlider(QSlider):
     def __init__(self, orientation: Qt.Orientation, parent=None) -> None:
         super().__init__(orientation, parent)
         self.marks: set[int] = set()
+        self.note_marks: list[tuple[int, int]] = []  # typed-note (start, end) ranges
         self.setPageStep(1)
         self.setSingleStep(1)
 
@@ -885,10 +926,17 @@ class TimelineSlider(QSlider):
             self.marks = nxt
             self.update()
 
+    def set_note_marks(self, ranges: list[tuple[int, int]]) -> None:
+        """Updates typed-note ranges drawn as cyan ticks under the groove."""
+        nxt = sorted((int(a), int(b)) for a, b in ranges)
+        if nxt != self.note_marks:
+            self.note_marks = nxt
+            self.update()
+
     def paintEvent(self, ev) -> None:
         """Paints standard slider groove/handle and overlays yellow drawing marker dots."""
         super().paintEvent(ev)
-        if not self.marks or self.maximum() <= self.minimum():
+        if (not self.marks and not self.note_marks) or self.maximum() <= self.minimum():
             return
         opt = QStyleOptionSlider()
         self.initStyleOption(opt)
@@ -907,6 +955,13 @@ class TimelineSlider(QSlider):
         for f in self.marks:
             x = QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), int(f), int(span), False)
             p.drawEllipse(QPointF(x0 + x, groove.center().y()), 3.2, 3.2)
+        # Typed notes: cyan bar under the groove spanning the note's range
+        p.setBrush(QColor("#33d6ff"))
+        y = groove.center().y() + 6.0
+        for a, b in self.note_marks:
+            xa = QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), int(a), int(span), False)
+            xb = QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), int(min(b, self.maximum())), int(span), False)
+            p.drawRoundedRect(QRectF(x0 + xa - 2.5, y - 1.5, max(5.0, xb - xa + 5.0), 3.0), 1.5, 1.5)
         p.end()
 
 
@@ -2453,6 +2508,46 @@ class FrameNumberBox(QWidget):
         p.end()
 
 
+class NoteDialog(QDialog):
+    """Typed review note editor: frame range (in displayed frame numbers) + text."""
+
+    def __init__(self, parent, first: int, last: int, start: int, end: int, text: str = "", title: str = "Review note") -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        self.sp_start = QSpinBox()
+        self.sp_end = QSpinBox()
+        for sp, v in ((self.sp_start, start), (self.sp_end, end)):
+            sp.setRange(int(first), int(last))
+            sp.setValue(int(v))
+            sp.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            sp.setFixedWidth(90)
+        row.addWidget(QLabel("Frames"))
+        row.addWidget(self.sp_start)
+        row.addWidget(QLabel("to"))
+        row.addWidget(self.sp_end)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.edit = QPlainTextEdit()
+        self.edit.setPlainText(text)
+        self.edit.setPlaceholderText("e.g. hold this pose 2 more frames, softer ease into the contact…")
+        self.edit.setMinimumHeight(110)
+        lay.addWidget(self.edit, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self.sp_start.valueChanged.connect(lambda v: self.sp_end.setValue(max(self.sp_end.value(), v)))
+        self.sp_end.valueChanged.connect(lambda v: self.sp_start.setValue(min(self.sp_start.value(), v)))
+        self.edit.setFocus()
+
+    def result_values(self) -> tuple[int, int, str]:
+        a, b = int(self.sp_start.value()), int(self.sp_end.value())
+        return min(a, b), max(a, b), self.edit.toPlainText().strip()
+
+
 class VolumeButton(QPushButton):
     """Checked = audio on: the button fills blue from the left proportional to volume."""
 
@@ -3558,7 +3653,33 @@ class Canvas(QWidget):
 
         # Frame counter HUD (screen-only; never part of exports)
         self._draw_frame_hud(p)
+        self._draw_text_notes(p)
         p.end()
+
+    def _draw_text_notes(self, p: QPainter) -> None:
+        """Typed review notes covering this frame, as a caption at the bottom-left."""
+        if not getattr(self, "show_text_notes", True) or self.project is None:
+            return
+        notes = self.project.notes_at(self.current_frame) if hasattr(self.project, "notes_at") else []
+        if not notes:
+            return
+        text = "\n".join(n.get("text", "").strip() for n in notes if n.get("text", "").strip())
+        if not text:
+            return
+        f = self.font()
+        f.setPointSize(max(10, int(self.height() / 52)))
+        p.setFont(f)
+        pad = 10
+        maxw = max(160.0, min(self.width() * 0.6, 720.0))
+        br = p.fontMetrics().boundingRect(QRect(0, 0, int(maxw), 4000), int(Qt.TextFlag.TextWordWrap), text)
+        box = QRectF(pad, self.height() - br.height() - pad * 3, br.width() + pad * 2, br.height() + pad)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 170))
+        p.drawRoundedRect(box, 5, 5)
+        p.setBrush(QColor("#33d6ff"))
+        p.drawRoundedRect(QRectF(box.x(), box.y(), 3.0, box.height()), 1.5, 1.5)
+        p.setPen(QColor("#f2f3f7"))
+        p.drawText(box.adjusted(pad, pad / 2, -pad / 2, -pad / 2), int(Qt.TextFlag.TextWordWrap), text)
 
     def _draw_frame_hud(self, p: QPainter) -> None:
         """Draws the frame counter badge (top-left). Skipped when disabled/empty."""
@@ -5714,6 +5835,7 @@ class MainWindow(QMainWindow):
         self._apply_settings_to_ui()
         self._apply_theme()
         self._build_menus()
+        self._build_notes_dock()
         self.statusBar().showMessage(
             "Middle-drag or scroll wheel to change frames."
         )
@@ -6211,6 +6333,7 @@ class MainWindow(QMainWindow):
         self._rebuild_autosave_menu()
         file_m.addSeparator()
         file_m.addAction(self._act("export", self.export_video))
+        file_m.addAction(self._act("export_review", self.export_review_sheet))
         file_m.addSeparator()
         file_m.addAction(self._act("quit", self.close))
 
@@ -6222,6 +6345,9 @@ class MainWindow(QMainWindow):
         edit.addAction(ovl_clear)
         ovl_clear.setEnabled(bool(self.project is not None and self.project.overlay_strokes))
         self._ovl_clear_action = ovl_clear
+        edit.addSeparator()
+        edit.addAction(self._act("add_note", self.add_text_note))
+        edit.addAction(self._act("add_range_note", lambda: self.add_text_note(ask_range=True)))
         edit.addSeparator()
 
         view = m.addMenu("View")
@@ -6239,6 +6365,9 @@ class MainWindow(QMainWindow):
         self.act_fov.setChecked(bool(self._settings.get("frame_overlay", False)))
         self.act_fov.toggled.connect(self._toggle_frame_overlay)
         view.addSeparator()
+        self.act_notes_panel = self._act("notes_panel", lambda: self._toggle_notes_dock())
+        self.act_notes_panel.setCheckable(True)
+        view.addAction(self.act_notes_panel)
         view.addAction(self._act("goto_frame", self._prompt_goto_frame))
         view.addAction(self._act("start_frame", lambda: self.box_start.begin_edit()))
 
@@ -6479,6 +6608,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_marks(self) -> None:
         self.slider.set_marks(self.project.annotated_frames())
+        self.slider.set_note_marks([(n["start"], n["end"]) for n in getattr(self.project, "text_notes", [])])
+        if hasattr(self, "notes_list"):
+            self._rebuild_notes_list()
 
     def goto_prev_drawing(self) -> None:
         frames = self.project.annotated_frames()
@@ -6624,6 +6756,10 @@ class MainWindow(QMainWindow):
     def _bind_new_project(self, path: str, count: int, fps: float, w: int, h: int, keep_strokes: dict | None = None) -> None:
         # Stash the outgoing media's drawings so switching shots never loses them
         old_path = getattr(self.project, "path", "")
+        if not hasattr(self, "_session_text_notes"):
+            self._session_text_notes: dict[str, list[dict]] = {}
+        if old_path and getattr(self.project, "text_notes", None):
+            self._session_text_notes[self._notes_key(old_path)] = list(self.project.text_notes)
         if old_path and not (bool(getattr(self.canvas, "is_board", False)) and not old_path):
             if any(s.points for lst in self.project.strokes.values() for s in lst):
                 self._session_notes[self._notes_key(old_path)] = dict(self.project.strokes)
@@ -6639,6 +6775,7 @@ class MainWindow(QMainWindow):
         if keep_strokes is not None:
             self.project.strokes = keep_strokes
         self.project.start_frame = self._initial_start_frame(path)
+        self.project.text_notes = list(self._session_text_notes.pop(self._notes_key(path), [])) if path else []
         self.canvas.project = self.project
         self._sync_start_box()
         still = bool(self._is_still)
@@ -7181,6 +7318,7 @@ class MainWindow(QMainWindow):
         self.btn_play.setEnabled(False)
         self.btn_play.setIcon(self._play_icon(False))
         self._update_time_label()
+        self._refresh_marks()
 
     def _queue_clear(self) -> None:
         self.queue_paths = []
@@ -7495,6 +7633,8 @@ class MainWindow(QMainWindow):
             int(proj.width or 1920), int(proj.height or 1080), keep_strokes=proj.strokes,
         )
         self.project.start_frame = int(getattr(proj, "start_frame", 0) or 0)
+        self.project.text_notes = list(getattr(proj, "text_notes", []))
+        self._refresh_marks()
         self._sync_start_box()
         self._update_time_label()
         self.project.scene_path = scene_path
@@ -7664,6 +7804,299 @@ class MainWindow(QMainWindow):
 
 
     # -----------------------------------------------------------------------
+    # Typed review notes (per frame / range) + sidebar + review sheet
+    # -----------------------------------------------------------------------
+
+    def _build_notes_dock(self) -> None:
+        dock = QDockWidget("Review Notes", self)
+        dock.setObjectName("review_notes_dock")
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        btn_style = (
+            "QPushButton { background:#2b2b2b; color:#ddd; border:1px solid #4a4a4a; border-radius:6px; padding:4px 8px; }"
+            "QPushButton:hover { background:#3c3c3c; } QPushButton:pressed { background:#5285a6; color:white; }"
+        )
+        for text, tip, slot in (
+            ("+ Note", "Add a note on the current frame [N]", lambda: self.add_text_note()),
+            ("+ Range", "Add a note over a frame range [Shift+N]", lambda: self.add_text_note(ask_range=True)),
+            ("Sheet…", "Export review sheet (CSV + HTML with thumbnails)", lambda: self.export_review_sheet()),
+        ):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setStatusTip(tip)
+            b.setStyleSheet(btn_style)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        lay.addLayout(row)
+        self.notes_list = QListWidget()
+        self.notes_list.setWordWrap(True)
+        self.notes_list.setStyleSheet(
+            "QListWidget { background:#1e1e22; color:#e6e6ea; border:1px solid #3a3a42; border-radius:6px; }"
+            "QListWidget::item { padding:6px 4px; border-bottom:1px solid #2c2c33; }"
+            "QListWidget::item:selected { background:#2f4a5c; color:white; }"
+        )
+        self.notes_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.notes_list.customContextMenuRequested.connect(self._notes_context_menu)
+        self.notes_list.itemClicked.connect(self._notes_jump)
+        self.notes_list.itemActivated.connect(self._notes_jump)
+        self.notes_list.itemDoubleClicked.connect(lambda it: self._edit_text_note(it.data(Qt.ItemDataRole.UserRole)))
+        self.notes_list.installEventFilter(self)
+        lay.addWidget(self.notes_list, 1)
+        hint = QLabel("Click = jump · Double-click = edit · Del = remove")
+        hint.setStyleSheet("color:#777; font-size:10px;")
+        lay.addWidget(hint)
+        dock.setWidget(body)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self.notes_dock = dock
+        visible = bool(self._settings.get("notes_panel", False))
+        dock.setVisible(visible)
+        self.act_notes_panel.setChecked(visible)
+        dock.visibilityChanged.connect(self._notes_dock_visibility)
+        self._rebuild_notes_list()
+
+    def _notes_dock_visibility(self, vis: bool) -> None:
+        if self.isVisible() or vis:
+            self._settings["notes_panel"] = bool(vis)
+        if hasattr(self, "act_notes_panel"):
+            self.act_notes_panel.blockSignals(True)
+            self.act_notes_panel.setChecked(bool(vis))
+            self.act_notes_panel.blockSignals(False)
+
+    def _toggle_notes_dock(self, show: bool | None = None) -> None:
+        if not hasattr(self, "notes_dock"):
+            return
+        show = (not self.notes_dock.isVisible()) if show is None else bool(show)
+        self.notes_dock.setVisible(show)
+        self._settings["notes_panel"] = show
+        self._schedule_save()
+
+    def _note_label(self, n: dict) -> str:
+        a = self.project.display_frame(n["start"])
+        b = self.project.display_frame(n["end"])
+        rng = f"{a}" if a == b else f"{a}–{b}"
+        return f"{rng}    {n.get('text', '')}"
+
+    def _rebuild_notes_list(self) -> None:
+        if not hasattr(self, "notes_list"):
+            return
+        self.notes_list.blockSignals(True)
+        self.notes_list.clear()
+        cur = int(self.canvas.current_frame)
+        for i, n in enumerate(self.project.text_notes):
+            it = QListWidgetItem(self._note_label(n))
+            it.setData(Qt.ItemDataRole.UserRole, i)
+            if n["start"] <= cur <= n["end"]:
+                f = it.font()
+                f.setBold(True)
+                it.setFont(f)
+            self.notes_list.addItem(it)
+        self.notes_list.blockSignals(False)
+
+    def _notes_jump(self, item) -> None:
+        i = item.data(Qt.ItemDataRole.UserRole)
+        if i is None or not (0 <= int(i) < len(self.project.text_notes)):
+            return
+        self._show_frame(int(self.project.text_notes[int(i)]["start"]))
+
+    def _notes_context_menu(self, pos) -> None:
+        it = self.notes_list.itemAt(pos)
+        menu = QMenu(self)
+        if it is not None:
+            i = int(it.data(Qt.ItemDataRole.UserRole))
+            menu.addAction("Edit note…", lambda: self._edit_text_note(i))
+            menu.addAction("Delete note", lambda: self._delete_text_note(i))
+            menu.addSeparator()
+        menu.addAction("Add note on current frame…", lambda: self.add_text_note())
+        menu.addAction("Export review sheet…", self.export_review_sheet)
+        menu.exec(self.notes_list.mapToGlobal(pos))
+
+    def _notes_changed(self) -> None:
+        self.project.text_notes.sort(key=lambda n: (n["start"], n["end"]))
+        self._refresh_marks()
+        self.canvas.update()
+        self._autosave_timer.start(250)
+
+    def add_text_note(self, ask_range: bool = False) -> None:
+        """Adds a typed note on the current frame (or a range)."""
+        if not self._clip_open():
+            self.statusBar().showMessage("Open a clip first")
+            return
+        start = int(self.project.start_frame)
+        last = start + max(self.project.frame_count - 1, 0)
+        cur = self.project.display_frame(self.canvas.current_frame)
+        end = min(cur + 10, last) if ask_range else cur
+        dlg = NoteDialog(self, start, last, cur, end, "", "Add range note" if ask_range else "Add note")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        a, b, text = dlg.result_values()
+        if not text:
+            return
+        self.project.text_notes.append({"start": a - start, "end": b - start, "text": text})
+        self._notes_changed()
+        if hasattr(self, "notes_dock") and not self.notes_dock.isVisible():
+            self._toggle_notes_dock(True)
+
+    def _edit_text_note(self, i) -> None:
+        if i is None or not (0 <= int(i) < len(self.project.text_notes)):
+            return
+        n = self.project.text_notes[int(i)]
+        start = int(self.project.start_frame)
+        last = start + max(self.project.frame_count - 1, 0)
+        dlg = NoteDialog(self, start, last, n["start"] + start, n["end"] + start, n.get("text", ""), "Edit note")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        a, b, text = dlg.result_values()
+        if not text:
+            self._delete_text_note(int(i))
+            return
+        n.update({"start": a - start, "end": b - start, "text": text})
+        self._notes_changed()
+
+    def _delete_text_note(self, i: int) -> None:
+        if 0 <= int(i) < len(self.project.text_notes):
+            del self.project.text_notes[int(i)]
+            self._notes_changed()
+
+    # -- shared frame renderer for review-sheet / frame exports -------------
+    def _open_export_reader(self):
+        """A private reader on the current media (never disturbs the viewport)."""
+        if getattr(self.canvas, "is_board", False) or self._is_still:
+            return None
+        r = VideoReader()
+        try:
+            r.open(self.project.path)
+        except Exception:
+            return None
+        return r
+
+    def _render_export_frame(self, index: int, reader=None) -> np.ndarray:
+        """BGR frame `index` with clip opacity, drawings and overlay burned in."""
+        if getattr(self.canvas, "is_board", False):
+            c = QColor(self.canvas.board_bg)
+            base = np.zeros((int(self.project.height or 1080), int(self.project.width or 1920), 3), np.uint8)
+            base[:] = (c.blue(), c.green(), c.red())
+        elif self._is_still and self._still_bgr is not None:
+            base = self._still_bgr.copy()
+        else:
+            bgr = reader.frame(index) if reader is not None else None
+            base = bgr.copy() if bgr is not None else np.zeros((int(self.project.height or 1080), int(self.project.width or 1920), 3), np.uint8)
+        clip_op = float(getattr(self.canvas, "clip_opacity", 1.0))
+        if clip_op < 0.995 and not getattr(self.canvas, "is_board", False):
+            fc = getattr(self.canvas, "fade_color", QColor("#ffffff"))
+            c = QColor(fc.name(QColor.NameFormat.HexRgb) if hasattr(fc, "name") else str(fc))
+            fade = np.array([c.blue(), c.green(), c.red()], dtype=np.float32)
+            base = (base.astype(np.float32) * clip_op + fade * (1.0 - clip_op)).astype(np.uint8)
+        nop = float(getattr(self.canvas, "notes_opacity", 1.0))
+        aa = bool(self.canvas.antialias)
+        strokes = self.project.strokes.get(index, [])
+        if strokes:
+            base = render_annotations_on_bgr(base, strokes, antialias=aa, notes_opacity=nop)
+        if self.project.overlay_strokes:
+            base = render_annotations_on_bgr(base, self.project.overlay_strokes, antialias=aa, notes_opacity=nop)
+        return base
+
+    def _review_rows(self) -> list[dict]:
+        """One row per typed note, plus one per drawn frame without a typed note."""
+        rows: list[dict] = []
+        covered: set[int] = set()
+        for n in self.project.text_notes:
+            rows.append({"start": n["start"], "end": n["end"], "text": n.get("text", "")})
+            covered.update(range(n["start"], n["end"] + 1))
+        for f in self.project.annotated_frames():
+            if f not in covered:
+                rows.append({"start": f, "end": f, "text": ""})
+        rows.sort(key=lambda r: (r["start"], r["end"]))
+        return rows
+
+    def export_review_sheet(self, dest: str | None = None) -> str | None:
+        """Writes <name>.csv and <name>.html (thumbnails embedded) for all notes."""
+        if not self._clip_open():
+            QMessageBox.information(self, "Review sheet", "Open a clip first.")
+            return None
+        self.canvas._end()
+        rows = self._review_rows()
+        if not rows:
+            QMessageBox.information(self, "Review sheet", "No notes or drawings to export yet.")
+            return None
+        stem = Path(self.project.path).stem if self.project.path else "board"
+        if dest is None:
+            export_dir = self._settings.get("last_export_dir") or self._save_start_dir()
+            default = str(Path(export_dir or Path.home()) / f"{stem}_review.html")
+            dest, _ = QFileDialog.getSaveFileName(self, "Export review sheet", default, "HTML review sheet (*.html)")
+            if not dest:
+                return None
+        if not dest.lower().endswith((".html", ".htm")):
+            dest += ".html"
+        html_path = Path(dest)
+        csv_path = html_path.with_suffix(".csv")
+        fps = float(self.project.fps or 24.0)
+        reader = self._open_export_reader()
+        prog = QProgressDialog("Building review sheet…", "Cancel", 0, len(rows), self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(300)
+        cards: list[str] = []
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as fh:
+                wr = csv.writer(fh)
+                wr.writerow(["shot", "frame_start", "frame_end", "timecode", "note", "has_drawing"])
+                for k, r in enumerate(rows):
+                    if prog.wasCanceled():
+                        return None
+                    prog.setValue(k)
+                    a, b = int(r["start"]), int(r["end"])
+                    drawn = any(self.project.strokes.get(f) for f in range(a, b + 1))
+                    da, db = self.project.display_frame(a), self.project.display_frame(b)
+                    tc = format_time(a, fps)
+                    wr.writerow([stem, da, db, tc, r["text"], "yes" if drawn else "no"])
+                    img = self._render_export_frame(a, reader)
+                    h, w = img.shape[:2]
+                    tw = 480
+                    th = max(1, int(round(h * tw / max(w, 1))))
+                    thumb = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+                    ok, buf = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    src = "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode() if ok else ""
+                    rng = f"{da}" if da == db else f"{da}–{db}"
+                    cards.append(
+                        f'<div class="card"><img src="{src}"><div class="meta"><b>{rng}</b>'
+                        f'<span>{html.escape(tc)}</span>{"<i>drawing</i>" if drawn else ""}</div>'
+                        f'<p>{html.escape(r["text"]).replace(chr(10), "<br>") or "<em>(drawing only)</em>"}</p></div>'
+                    )
+        finally:
+            if reader is not None:
+                reader.close()
+            prog.close()
+        title = html.escape(Path(self.project.path).name if self.project.path else "Drawing board")
+        page = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            f"<title>{title} — InkIt review</title><style>"
+            "body{background:#1a1a1c;color:#e6e6ea;font-family:Segoe UI,Arial,sans-serif;margin:24px}"
+            "h1{font-size:20px;margin:0 0 4px} .sub{color:#8a8a95;margin-bottom:18px}"
+            ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}"
+            ".card{background:#24242a;border:1px solid #33343c;border-radius:8px;overflow:hidden}"
+            ".card img{width:100%;display:block;background:#000}"
+            ".meta{display:flex;gap:12px;align-items:center;padding:8px 12px 0;color:#8a8a95}"
+            ".meta b{color:#33d6ff;font-size:15px} .meta i{color:#ffcc00;font-style:normal}"
+            "p{margin:6px 12px 12px;line-height:1.4} em{color:#777}"
+            "@media print{body{background:#fff;color:#000}.card{break-inside:avoid;background:#fff}}"
+            "</style></head><body>"
+            f"<h1>{title}</h1><div class='sub'>{len(rows)} notes · {fps:g} fps · frames "
+            f"{self.project.display_frame(0)}–{self.project.display_frame(max(self.project.frame_count - 1, 0))}"
+            f" · exported {time.strftime('%Y-%m-%d %H:%M')}</div>"
+            f"<div class='grid'>{''.join(cards)}</div></body></html>"
+        )
+        html_path.write_text(page, encoding="utf-8")
+        self._settings["last_export_dir"] = str(html_path.parent)
+        self._schedule_save()
+        self.statusBar().showMessage(f"Review sheet saved: {html_path.name} + {csv_path.name}", 5000)
+        return str(html_path)
+
+    # -----------------------------------------------------------------------
     # Start frame number (display offset)
     # -----------------------------------------------------------------------
 
@@ -7732,6 +8165,9 @@ class MainWindow(QMainWindow):
             self.canvas.frame_overlay_text = t
         if getattr(self.canvas, "frame_overlay", False):
             self.canvas.update()
+        if hasattr(self, "notes_dock") and self.notes_dock.isVisible() and getattr(self, "_notes_bold_frame", None) != f:
+            self._notes_bold_frame = f
+            self._rebuild_notes_list()
         self._update_maya_status_indicator()
 
     def _toggle_time_mode(self) -> None:
@@ -9014,6 +9450,8 @@ Start-Sleep -Milliseconds 80
         else:
             ok = self._open_video_path(proj.path, strokes=proj.strokes)
         if ok:
+            self.project.text_notes = list(proj.text_notes)
+            self._refresh_marks()
             if "start_frame" in data:
                 self.project.start_frame = int(data.get("start_frame") or 0)
                 self._sync_start_box()
@@ -9056,6 +9494,11 @@ Start-Sleep -Milliseconds 80
         # leave. Floating tooltip windows are suppressed entirely (QEvent.ToolTip
         # is consumed), so ALL hover info lives in the status bar only.
         et = ev.type()
+        if obj is getattr(self, "notes_list", None) and et == QEvent.Type.KeyPress and ev.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            it = self.notes_list.currentItem()
+            if it is not None:
+                self._delete_text_note(int(it.data(Qt.ItemDataRole.UserRole)))
+            return True
         if et == QEvent.Type.ToolTip:
             return True  # no floating tooltips — hover info goes to the status bar
         # Eyedropper owns ALL mouse input while open: clicks sample the color
@@ -9239,7 +9682,7 @@ Start-Sleep -Milliseconds 80
         is_board = bool(getattr(self.canvas, "is_board", False)) and not self.project.path
         if not self.project.path and not is_board:
             return
-        if not self.project.annotated_frames() and not self.project.user_saved:
+        if not self.project.annotated_frames() and not self.project.text_notes and not self.project.user_saved:
             return
         if (
             self.project.user_saved
