@@ -74,7 +74,7 @@ If you are an UI/UX artists and interested in the tool please get in touch to ma
 
 ## Quick start
 
-**Fully compiled, no dependencies:** download the latest `InkIt.exe` from **Releases** and run it. Just double-click — that's it.
+**Fully compiled, no dependencies:** download the latest `InkIt.exe` from **Releases** (published automatically for every `v*` tag), or grab the `InkIt-exe` artifact from the latest **Actions ▸ Build InkIt.exe** run. Just double-click — that's it.
 
 **Run from source (developers):**
 ```
@@ -107,13 +107,22 @@ or double-click `Launch InkIt.vbs` / `Launch InkIt.bat` if you're running from a
 
 ## Building from source
 
-The executable is built once with PyInstaller from the bundled spec and released to **Releases**. If you edit the source and want to rebuild, run:
+The single self-contained `InkIt.exe` is built with PyInstaller from `InkIt.spec` (onefile; bundles Python, Qt, OpenCV, `ffmpeg.exe` from imageio-ffmpeg, the `icons/` folder, the app icons and the Maya sync scripts).
+
+On Windows, just run:
 
 ```
-pyinstaller --clean --noconfirm InkIt.spec
+build.bat
 ```
 
----
+It creates/uses `.venv`, installs `requirements.txt`, runs a compile check and then `pyinstaller --clean --noconfirm InkIt.spec`. The result is `dist\InkIt.exe`.
+
+CI: `.github/workflows/build.yml` builds the exe on `windows-latest` for every push / pull request (download it from the run's **Artifacts**), runs a headless smoke test, and publishes a GitHub Release with the exe attached when you push a tag such as `v1.2.0`:
+
+```
+git tag v1.2.0
+git push origin v1.2.0
+```
 
 ## Notes
 
