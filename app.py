@@ -113,6 +113,7 @@ from PySide6.QtCore import (
     QPointF,
     QRect,
     QRectF,
+    QSettings,
     QSize,
     Qt,
     QThread,
@@ -920,7 +921,7 @@ ACTION_LABELS: dict[str, str] = {
     "queue_panel": "Shot list",
     "time_mode": "Frames / time display",
     "goto_frame": "Go to frame…",
-    "compare_mode": "Compare mode (wipe / side by side / off)",
+    "compare_mode": "Compare mode (cycle)",
     "compare_load": "Compare A/B: load B…",
     "export_frames": "Export annotated frames…",
     "set_fps": "Frame rate…",
@@ -972,7 +973,7 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "queue_panel": "Show or hide the shot list panel",
     "time_mode": "Switch timeline between frames and timecode",
     "goto_frame": "Type a frame number to jump to",
-    "compare_mode": "Cycle the A/B compare view",
+    "compare_mode": "Cycle the A/B compare view (wipe / side by side / overlay / B only / A only)",
     "compare_load": "Load a second clip / sequence to compare against, frame-locked",
     "export_frames": "Write every drawn / noted frame as PNG plus a contact sheet",
     "set_fps": "Override the playback / export frame rate",
@@ -1954,16 +1955,56 @@ class BoxSlider(QWidget):
         )
         self._label_w = 36 if icon else fm.horizontalAdvance(title)
         self._val_w = val_w
-        track_w = 59
+        # Value-only control (no track): [glyph/title] [value%]
         self.setFixedSize(
-            int(8 + self._label_w + 6 + track_w + 6 + val_w + 8),
+            int(8 + self._label_w + 6 + val_w + 8),
             36 if icon else 24,
         )
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._press_x = 0.0
         self._press_frac = 0.0
         self._press_value = 0
-        self._rel_drag = False
+        self._moved = False
+        self._edit = QLineEdit(self)
+        self._edit.setValidator(QIntValidator(self.minimum, self.maximum, self))
+        self._edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._edit.setStyleSheet(
+            "QLineEdit { background:#1e1e22; color:white; border:1px solid #5285a6;"
+            " border-radius:5px; font-weight:bold; padding:0 4px; }"
+        )
+        self._edit.hide()
+        self._edit.returnPressed.connect(self._commit_edit)
+        self._edit.editingFinished.connect(self._commit_edit)
+        self._edit.installEventFilter(self)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+
+    def begin_edit(self) -> None:
+        """Inline typing of the value (click without dragging)."""
+        x = 8.0 + float(self._label_w) + 2.0
+        self._edit.setGeometry(int(x), 2, int(self.width() - x - 4), self.height() - 4)
+        self._edit.setText(str(self._value))
+        self._edit.show()
+        self._edit.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._edit.selectAll()
+
+    def _commit_edit(self) -> None:
+        if not self._edit.isVisible():
+            return
+        txt = self._edit.text().strip()
+        self._edit.hide()
+        if txt and txt not in ("-", "+"):
+            try:
+                self.setValue(int(txt))
+            except ValueError:
+                pass
+
+    def eventFilter(self, obj, ev) -> bool:
+        if obj is self._edit and ev.type() == QEvent.Type.KeyPress and ev.key() == Qt.Key.Key_Escape:
+            self._edit.blockSignals(True)
+            self._edit.hide()
+            self._edit.blockSignals(False)
+            return True
+        return super().eventFilter(obj, ev)
 
     def _label(self) -> str:
         return f"{self.title} {self._value}{self.suffix}"
@@ -2023,21 +2064,9 @@ class BoxSlider(QWidget):
                 int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
                 self.title,
             )
-        tx0, tw = self._track_geom()
-        # trailing value in a fixed-width column so track geometry is stable
+        # trailing value only — the slider track/fill was removed
         val = self._label_value()
         vx = float(self.width()) - 8.0 - float(self._val_w)
-        frac = self._frac()
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#33343c"))
-        p.drawRoundedRect(QRectF(tx0, cy - 2.0, tw, 4.0), 2.0, 2.0)
-        fw = frac * tw
-        if fw > 0.5:
-            p.setBrush(QColor("#3d5afe"))
-            p.drawRoundedRect(QRectF(tx0, cy - 2.0, fw, 4.0), 2.0, 2.0)
-        p.setPen(QPen(QColor("#202028"), 1))
-        p.setBrush(QColor("#f2f3f7"))
-        p.drawEllipse(QPointF(tx0 + fw, cy), 5.0, 5.0)
         p.setPen(QColor("#eef0f5"))
         p.drawText(
             QRectF(vx, 0.0, float(self._val_w), h),
@@ -2045,54 +2074,26 @@ class BoxSlider(QWidget):
             val,
         )
 
-    def _track_geom(self) -> tuple[float, float]:
-        """Track x-start and width — the exact geometry used by painting."""
-        tx0 = 8.0 + float(self._label_w) + 6.0
-        tw = float(self.width()) - 8.0 - float(self._val_w) - 6.0 - tx0
-        return tx0, tw
-
-    def _raw_frac(self, x: float) -> float:
-        """Unclamped 0..1 position across the widget (relative-drag math)."""
-        m = 8.0
-        span = max(1.0, self.width() - 2 * m)
-        return (x - m) / span
-
-    def _frac_at(self, x: float) -> float:
-        return min(max(self._raw_frac(x), 0.0), 1.0)
-
-    def _value_at_frac(self, f: float) -> int:
-        return int(round(self.minimum + f * (self.maximum - self.minimum)))
-
     def mousePressEvent(self, ev) -> None:
         if ev.button() == Qt.MouseButton.LeftButton:
             self._drag = True
+            self._moved = False
             self._press_x = ev.position().x()
-            self._press_frac = self._frac_at(self._press_x)
             self._press_value = self._value
-            tx0, tw = self._track_geom()
-            if tw > 1 and tx0 - 4 <= self._press_x <= tx0 + tw + 4:
-                # Press on the track: knob jumps exactly under the pointer.
-                self._rel_drag = False
-                f = min(max((self._press_x - tx0) / tw, 0.0), 1.0)
-                self.setValue(self._value_at_frac(f))
-            else:
-                # Press on icon/label: no jump — drag adjusts from current %.
-                self._rel_drag = True
             ev.accept()
             return
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev) -> None:
         if self._drag:
-            if self._rel_drag:
-                # Relative from where it was; Ctrl = 1/8 fine-tune speed.
+            dx = ev.position().x() - self._press_x
+            if abs(dx) >= 3:
+                self._moved = True
+            if self._moved:
+                # Relative drag: full range over ~150 px; Ctrl = 1/8 fine-tune speed.
                 speed = 8.0 if (ev.modifiers() & Qt.KeyboardModifier.ControlModifier) else 1.0
-                df = (self._raw_frac(ev.position().x()) - self._press_frac) / speed
-                self.setValue(int(round(self._press_value + df * (self.maximum - self.minimum))))
-            else:
-                tx0, tw = self._track_geom()
-                f = min(max((ev.position().x() - tx0) / max(tw, 1.0), 0.0), 1.0)
-                self.setValue(self._value_at_frac(f))
+                span = max(1, self.maximum - self.minimum)
+                self.setValue(int(round(self._press_value + dx / 150.0 * span / speed)))
             ev.accept()
             return
         super().mouseMoveEvent(ev)
@@ -2100,6 +2101,8 @@ class BoxSlider(QWidget):
     def mouseReleaseEvent(self, ev) -> None:
         if self._drag:
             self._drag = False
+            if not self._moved:
+                self.begin_edit()
             ev.accept()
             return
         super().mouseReleaseEvent(ev)
@@ -3453,8 +3456,9 @@ class Canvas(QWidget):
         self.frame_overlay_text = ""
         # A/B compare: B frame shown via wipe or side-by-side; drawings stay on A
         self.compare_image: QImage | None = None
-        self.compare_mode = "off"      # 'off' | 'wipe' | 'side'
+        self.compare_mode = "off"      # 'off' (A only) | 'bonly' | 'wipe' | 'side' | 'overlay'
         self.compare_wipe = 0.5        # wipe split position across A (0..1)
+        self.compare_opacity = 0.5     # B opacity in overlay mode (0..1)
         self.compare_labels = ("A", "B")
         self.theme = dict(THEMES["dark"])   # Active palette for painted chrome
         self.current_frame = 0              # Currently displayed frame index
@@ -3700,7 +3704,7 @@ class Canvas(QWidget):
 
 
     def _compare_active(self) -> bool:
-        return self.compare_mode in ("wipe", "side") and self.compare_image is not None and not self.compare_image.isNull()
+        return self.compare_mode in ("wipe", "side", "bonly", "overlay") and self.compare_image is not None and not self.compare_image.isNull()
 
     def _layout_rect(self) -> QRect:
         """Viewport area for clip A: the left half in side-by-side compare."""
@@ -3722,7 +3726,14 @@ class Canvas(QWidget):
         """Paints clip B (wipe over A's rect, or in the right half) plus A/B badges."""
         if not self._compare_active() or self._dst.isEmpty():
             return
-        if self.compare_mode == "wipe":
+        if self.compare_mode in ("bonly", "overlay"):
+            p.save()
+            p.setOpacity(1.0 if self.compare_mode == "bonly" else min(max(self.compare_opacity, 0.0), 1.0))
+            p.drawImage(self._dst, self.compare_image)
+            p.restore()
+            a_box = QPointF(self._dst.x() + 10, self._dst.bottom() - 34)
+            b_box = QPointF(self._dst.right() - 10, self._dst.bottom() - 34)
+        elif self.compare_mode == "wipe":
             x = self._dst.x() + self._dst.width() * min(max(self.compare_wipe, 0.0), 1.0)
             clip = QRectF(x, self._dst.y(), self._dst.right() - x, self._dst.height())
             p.save()
@@ -3746,7 +3757,12 @@ class Canvas(QWidget):
         f.setPointSize(10)
         p.setFont(f)
         fm = p.fontMetrics()
-        for (pt, text, right) in ((a_box, self.compare_labels[0], False), (b_box, self.compare_labels[1], True)):
+        badges = [(a_box, self.compare_labels[0], False), (b_box, self.compare_labels[1], True)]
+        if self.compare_mode == "bonly":
+            badges = badges[1:]
+        elif self.compare_mode == "overlay":
+            badges[1] = (b_box, f"{self.compare_labels[1]}  {int(round(self.compare_opacity * 100))}%", True)
+        for (pt, text, right) in badges:
             tw = fm.horizontalAdvance(text) + 14
             rect = QRectF(pt.x() - tw if right else pt.x(), pt.y(), tw, 24)
             p.setPen(Qt.PenStyle.NoPen)
@@ -8166,9 +8182,11 @@ class MainWindow(QMainWindow):
         self.lbl_compare.setStyleSheet("color:#33d6ff; font-weight:bold;")
         lay.addWidget(self.lbl_compare)
         self._compare_btns: dict[str, QPushButton] = {}
-        for key, text, tip in (("wipe", "Wipe", "Wipe: A left of the split, B right"),
+        for key, text, tip in (("off", "A only", "Show A only (keep B loaded)"),
+                               ("bonly", "B only", "Show B only, in A's frame (drawings stay visible)"),
+                               ("wipe", "Wipe", "Wipe: A left of the split, B right"),
                                ("side", "Side by side", "A on the left, B on the right"),
-                               ("off", "A only", "Hide B (keep it loaded)")):
+                               ("overlay", "Overlay", "B over A at adjustable opacity")):
             b = QPushButton(text)
             b.setCheckable(True)
             b.setToolTip(tip)
@@ -8181,6 +8199,11 @@ class MainWindow(QMainWindow):
         self.sl_wipe.setToolTip("Wipe position — click or drag")
         self.sl_wipe.valueChanged.connect(self._set_compare_wipe)
         lay.addWidget(self.sl_wipe)
+        self.sl_b_op = BoxSlider("B opacity", 0, 100, int(self._settings.get("compare_opacity", 50)))
+        self.sl_b_op.setToolTip("B opacity over A — drag left/right or click to type")
+        self.sl_b_op.valueChanged.connect(self._set_compare_opacity)
+        self.canvas.compare_opacity = self.sl_b_op.value() / 100.0
+        lay.addWidget(self.sl_b_op)
         self.box_compare_start = FrameNumberBox("B start", 0)
         self.box_compare_start.setToolTip("First frame number of clip B — B is locked to A by frame number (click to type, drag to scrub)")
         self.box_compare_start.valueChanged.connect(self._set_compare_start)
@@ -8248,7 +8271,7 @@ class MainWindow(QMainWindow):
         self.canvas.compare_labels = (f"A  {media_stem(self.project.path)}", f"B  {media_stem(path)}")
         self._compare_bar.setVisible(True)
         if self.canvas.compare_mode == "off":
-            self._set_compare_mode(self._settings.get("compare_mode", "wipe") if self._settings.get("compare_mode") in ("wipe", "side") else "wipe")
+            self._set_compare_mode(self._settings.get("compare_mode", "wipe") if self._settings.get("compare_mode") in ("wipe", "side", "bonly", "overlay") else "wipe")
         else:
             self._set_compare_mode(self.canvas.compare_mode)
         return True
@@ -8263,8 +8286,14 @@ class MainWindow(QMainWindow):
         self.canvas._cache_key = None
         self.canvas.update()
 
+    def _set_compare_opacity(self, v: int) -> None:
+        self.canvas.compare_opacity = max(0, min(100, int(v))) / 100.0
+        self._settings["compare_opacity"] = int(v)
+        self._schedule_save()
+        self.canvas.update()
+
     def _set_compare_mode(self, mode: str) -> None:
-        if mode not in ("off", "wipe", "side"):
+        if mode not in ("off", "bonly", "wipe", "side", "overlay"):
             mode = "off"
         self.canvas.compare_mode = mode
         if mode != "off":
@@ -8272,6 +8301,7 @@ class MainWindow(QMainWindow):
         for k, b in self._compare_btns.items():
             b.setChecked(k == mode)
         self.sl_wipe.setVisible(mode == "wipe")
+        self.sl_b_op.setVisible(mode == "overlay")
         self.canvas._cache_key = None  # layout changed: rebuild stroke cache
         self._update_compare_frame(self.canvas.current_frame)
         self.canvas.update()
@@ -8280,7 +8310,7 @@ class MainWindow(QMainWindow):
         if not self.compare_path:
             self.load_compare_clip()
             return
-        order = ["wipe", "side", "off"]
+        order = ["wipe", "side", "overlay", "bonly", "off"]
         cur = self.canvas.compare_mode if self.canvas.compare_mode in order else "off"
         self._set_compare_mode(order[(order.index(cur) + 1) % len(order)])
 
@@ -8701,7 +8731,20 @@ class MainWindow(QMainWindow):
         if seq_start is not None:
             return int(seq_start)
         det = detect_start_frame(path)
-        return int(det) if det is not None else 0
+        if det is not None:
+            return int(det)
+        return self._last_start_frame()
+
+    @staticmethod
+    def _qsettings() -> QSettings:
+        return QSettings("InkIt", "InkIt")
+
+    def _last_start_frame(self) -> int:
+        """Last start frame the user set anywhere (QSettings), default 0."""
+        try:
+            return int(self._qsettings().value("start_frame/last", 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _sync_start_box(self) -> None:
         if hasattr(self, "box_start"):
@@ -8713,6 +8756,9 @@ class MainWindow(QMainWindow):
         if value == int(self.project.start_frame):
             return
         self.project.start_frame = value
+        qs = self._qsettings()
+        qs.setValue("start_frame/last", value)
+        qs.sync()
         path = getattr(self.project, "path", "") or ""
         if path:
             sf = dict(self._settings.get("start_frames", {}) or {})

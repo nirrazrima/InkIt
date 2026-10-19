@@ -315,6 +315,7 @@ def test_compare(w, tmp: Path, qapp) -> None:
     w._settings.get("start_frames", {}).pop(w._notes_key(str(a)), None)
     w._open_video_path(str(a))
     check(w.project.start_frame == 1001, "A start 1001")
+    w._settings["compare_mode"] = "wipe"
     check(w.load_compare_clip(str(bdir / "sh050_v002.1020.png")), "load B from any sequence frame")
     check(w.compare_start == 1011 and w.canvas.compare_mode == "wipe", "B start 1011 detected, wipe mode on")
     w._show_frame(25)  # A frame 1026 -> B frame 1026 -> B index 15
@@ -334,6 +335,29 @@ def test_compare(w, tmp: Path, qapp) -> None:
     w.canvas.repaint()
     check(w.canvas._dst.width() < full.width() * 0.75, "side-by-side puts A in the left half")
     w.grab().save(str(shots / "compare_side.png"))
+    # B only / Overlay: sample a pixel of the drawing-free area (A frame 30 vs B frame 20)
+    def px():
+        w.canvas.repaint()
+        img = w.canvas.grab().toImage()
+        d = w.canvas._dst
+        return img.pixelColor(int(d.x() + d.width() * 0.075), int(d.y() + d.height() * 0.04)).lightness()
+    a_bits = (30 >> 1) & 1   # second block = bit 1 of the frame index (A=1)
+    b_bits = (20 >> 1) & 1   # (B=0)
+    w._set_compare_mode("bonly")
+    qapp.processEvents()
+    v_b = px()
+    check(abs(w.canvas._dst.width() - full.width()) < 2 and (v_b > 200) == bool(b_bits), f"B only shows B in A's frame ({v_b})")
+    w._set_compare_mode("overlay")
+    w.sl_b_op.setValue(0)
+    v0 = px()
+    w.sl_b_op.setValue(100)
+    v100 = px()
+    w.sl_b_op.setValue(50)
+    v50 = px()
+    check(w.sl_b_op.isVisible() and not w.sl_wipe.isVisible(), "overlay shows the B opacity control")
+    check((v0 > 200) == bool(a_bits) and (v100 > 200) == bool(b_bits) and min(v0, v100) < v50 < max(v0, v100) + 1,
+          f"overlay blends B over A by opacity (0%={v0}, 50%={v50}, 100%={v100})")
+    w.grab().save(str(shots / "compare_overlay.png"))
     w._set_compare_mode("off")
     qapp.processEvents()
     w.canvas.repaint()
@@ -342,7 +366,44 @@ def test_compare(w, tmp: Path, qapp) -> None:
     check(w.canvas.compare_image is None and not w._compare_bar.isVisible(), "close compare")
 
 
-FEATURE_TESTS = [test_frame_accurate_seek, test_start_frame, test_text_notes, test_sequences_fps_frames, test_compare]
+def test_value_controls_and_start_memory(w, tmp: Path, qapp) -> None:
+    """Value-only BoxSlider (no track): click-to-type + drag; start frame remembered globally."""
+    from PySide6.QtCore import QPoint, Qt as _Qt
+    from PySide6.QtTest import QTest
+    sl = w.sl_pen_op
+    check(not hasattr(sl, "_track_geom"), "BoxSlider has no slider track any more")
+    sl.setValue(50)
+    QTest.mouseClick(sl, _Qt.MouseButton.LeftButton, pos=QPoint(sl.width() - 10, sl.height() // 2))
+    qapp.processEvents()
+    check(sl._edit.isVisible(), "click on a value control opens inline typing")
+    sl._edit.selectAll()
+    QTest.keyClicks(sl._edit, "73")
+    QTest.keyClick(sl._edit, _Qt.Key.Key_Return)
+    check(sl.value() == 73, f"typed value applied ({sl.value()})")
+    y = sl.height() // 2
+    QTest.mousePress(sl, _Qt.MouseButton.LeftButton, pos=QPoint(20, y))
+    QTest.mouseMove(sl, QPoint(30, y))
+    QTest.mouseMove(sl, QPoint(5, y))
+    QTest.mouseRelease(sl, _Qt.MouseButton.LeftButton, pos=QPoint(5, y))
+    check(sl.value() == 63 and not sl._edit.isVisible(), f"drag changes value relatively (-15px -> {sl.value()})")
+
+    # Start frame: last user value is used for clips without detected/saved start
+    w._open_video_path(str(tmp / "shot_test.mp4"))
+    w._set_start_frame(6586)
+    check(int(w._qsettings().value("start_frame/last", 0)) == 6586, "last start frame persisted in QSettings")
+    plain = tmp / "plainclip.mp4"
+    make_clip(plain)
+    w._settings.get("start_frames", {}).pop(w._notes_key(str(plain)), None)
+    w._open_video_path(str(plain))
+    check(w.project.start_frame == 6586 and w.box_start.value() == 6586, "new clip without a start uses the last value (6586)")
+    numbered = tmp / "sh060_1001-1047.mp4"
+    make_clip(numbered)
+    w._settings.get("start_frames", {}).pop(w._notes_key(str(numbered)), None)
+    w._open_video_path(str(numbered))
+    check(w.project.start_frame == 1001, "auto-detected start still wins over the last value")
+
+
+FEATURE_TESTS = [test_value_controls_and_start_memory, test_frame_accurate_seek, test_start_frame, test_text_notes, test_sequences_fps_frames, test_compare]
 
 
 def main() -> int:
