@@ -101,6 +101,9 @@ if "__compiled__" in globals():
         except OSError:
             pass
 
+# OpenEXR decoding in OpenCV 4.x is opt-in and must be enabled before import.
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
 import cv2
 import numpy as np
 from PySide6.QtCore import (
@@ -285,6 +288,9 @@ class Project:
         # Typed review notes: [{"start": f0, "end": f1, "text": "..."}] with
         # 0-based inclusive frame range (start == end for a single frame).
         self.text_notes: list[dict] = []
+        # User frame-rate override (None = use the media's own rate)
+        self.fps_override: float | None = None
+        self.native_fps: float = 24.0
 
     def notes_at(self, f: int) -> list[dict]:
         """Typed notes whose frame range covers frame `f`."""
@@ -326,6 +332,7 @@ class Project:
             "strokes": {str(k): [stroke_d(s) for s in v] for k, v in self.strokes.items() if v},
             "overlay_strokes": [stroke_d(s) for s in self.overlay_strokes],
             "start_frame": int(self.start_frame),
+            "fps_override": self.fps_override,
             "text_notes": [
                 {"start": int(n["start"]), "end": int(n["end"]), "text": str(n.get("text", ""))}
                 for n in self.text_notes
@@ -337,11 +344,11 @@ class Project:
         video = data.get("video") or ""
         if video:
             p = Path(video)
-            if not p.is_file() and scene_dir is not None:
+            if not media_exists(p) and scene_dir is not None:
                 alt = scene_dir / p.name
-                if alt.is_file():
+                if media_exists(alt):
                     p = alt
-            self.path = str(p) if p.is_file() else video
+            self.path = str(p) if media_exists(p) else video
         # Restore timeline geometry so media-less board scenes reopen correctly
         if data.get("fps"):
             self.fps = float(data["fps"])
@@ -353,6 +360,8 @@ class Project:
             self.height = int(data["height"])
         # Older scenes have no start frame: they keep displaying from 0
         self.start_frame = int(data.get("start_frame", 0) or 0)
+        fo = data.get("fps_override")
+        self.fps_override = float(fo) if fo else None
         self.text_notes = []
         for n in data.get("text_notes", []) or []:
             try:
@@ -390,6 +399,120 @@ class Project:
 # 3. VIDEO DECODING & HELPERS
 # ===========================================================================
 
+SEQUENCE_EXTS = (".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff", ".bmp")
+_SEQ_RE = re.compile(r"^(?P<head>.*?)(?P<num>\d+)(?P<tail>\.[^.]+)$")
+
+
+def is_sequence_path(p: str | Path | None) -> bool:
+    """True for an image-sequence pattern such as 'shot.####.png'."""
+    return bool(p) and "#" in Path(str(p)).name
+
+
+def sequence_pattern_for(frame_file: str | Path) -> str | None:
+    """'shot.1001.png' -> 'shot.####.png' if at least 2 sibling frames exist."""
+    f = Path(frame_file)
+    m = _SEQ_RE.match(f.name)
+    if not m or f.suffix.lower() not in SEQUENCE_EXTS:
+        return None
+    pat = str(f.parent / f"{m.group('head')}{'#' * len(m.group('num'))}{m.group('tail')}")
+    return pat if len(sequence_files(pat)[0]) >= 2 else None
+
+
+def sequence_files(pattern: str | Path) -> tuple[list[str], int]:
+    """Frame files for a '#' pattern, one per frame NUMBER from first to last
+    (missing numbers hold the previous frame), plus the first frame number."""
+    pat = Path(str(pattern))
+    name = pat.name
+    i = name.index("#")
+    j = i
+    while j < len(name) and name[j] == "#":
+        j += 1
+    head, tail = name[:i], name[j:]
+    found: dict[int, str] = {}
+    try:
+        for f in pat.parent.iterdir():
+            n = f.name
+            if n.startswith(head) and n.endswith(tail) and len(n) > len(head) + len(tail):
+                mid = n[len(head):len(n) - len(tail)]
+                if mid.isdigit():
+                    found[int(mid)] = str(f)
+    except OSError:
+        return [], 0
+    if not found:
+        return [], 0
+    first, last = min(found), max(found)
+    files: list[str] = []
+    prev = found[first]
+    for k in range(first, last + 1):
+        prev = found.get(k, prev)
+        files.append(prev)
+    return files, first
+
+
+def sequence_in_folder(folder: str | Path) -> str | None:
+    """Pattern of the longest image sequence inside `folder`, if any."""
+    best: tuple[int, str] | None = None
+    seen: set[str] = set()
+    try:
+        for f in sorted(Path(folder).iterdir()):
+            pat = sequence_pattern_for(f) if f.is_file() else None
+            if pat and pat not in seen:
+                seen.add(pat)
+                n = len(sequence_files(pat)[0])
+                if best is None or n > best[0]:
+                    best = (n, pat)
+    except OSError:
+        return None
+    return best[1] if best else None
+
+
+def media_exists(p: str | Path | None) -> bool:
+    if not p:
+        return False
+    if is_sequence_path(p):
+        return bool(sequence_files(p)[0])
+    return Path(str(p)).is_file()
+
+
+def media_stem(p: str | Path | None) -> str:
+    """File stem for naming exports; 'shot.####.png' -> 'shot'."""
+    if not p:
+        return "board"
+    stem = Path(str(p)).stem
+    return stem.replace("#", "").rstrip("._- ") or "sequence"
+
+
+def read_image_bgr(path: str) -> np.ndarray | None:
+    """Reads PNG/JPG/TIFF/EXR as 8-bit BGR (EXR/float: linear -> sRGB, clipped)."""
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
+    if img is None:
+        return None
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[2] == 4:
+        img = img[:, :, :3]
+    if img.dtype == np.uint8:
+        return np.ascontiguousarray(img)
+    if img.dtype == np.uint16:
+        return (img >> 8).astype(np.uint8)
+    lin = np.clip(img.astype(np.float32), 0.0, 1.0)
+    srgb = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
+    return np.ascontiguousarray((srgb * 255.0 + 0.5).astype(np.uint8))
+
+
+class _SequenceCapture:
+    """Stand-in for cv2.VideoCapture over an image sequence (only release())."""
+
+    def __init__(self, files: list[str]) -> None:
+        self.files = files
+
+    def release(self) -> None:
+        self.files = []
+
+    def isOpened(self) -> bool:
+        return bool(self.files)
+
+
 class VideoReader:
     """
     Frame-accurate video frame reader using OpenCV VideoCapture.
@@ -420,10 +543,16 @@ class VideoReader:
         self._ts_ok = True
         self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
         self._cache_max = 64
+        self.is_sequence = False
+        self.seq_start: int | None = None  # first frame number of an image sequence
 
     def open(self, path: str) -> tuple[int, float, int, int]:
-        """Opens video file and returns (frame_count, fps, width, height)."""
+        """Opens a video file or image-sequence pattern; returns (frame_count, fps, width, height)."""
         self.close()
+        if is_sequence_path(path):
+            return self._open_sequence(path)
+        self.is_sequence = False
+        self.seq_start = None
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video:\n{path}")
@@ -461,6 +590,26 @@ class VideoReader:
                 h, w = bgr.shape[:2]
         self.count = count
         return count, fps, w, h
+
+    def _open_sequence(self, pattern: str) -> tuple[int, float, int, int]:
+        files, first = sequence_files(pattern)
+        if not files:
+            raise RuntimeError(f"No frames found for image sequence:\n{pattern}")
+        bgr = read_image_bgr(files[0])
+        if bgr is None:
+            raise RuntimeError(f"Could not read image:\n{files[0]}")
+        self.cap = _SequenceCapture(files)  # type: ignore[assignment]
+        self.path = pattern
+        self.is_sequence = True
+        self.seq_start = int(first)
+        self.fps = 24.0
+        self.count = len(files)
+        h, w = bgr.shape[:2]
+        self._cache_max = int(min(max(self.CACHE_BYTES // max(1, bgr.nbytes), 8), 240))
+        self._cache_put(0, bgr)
+        self._last_idx = 0
+        self._last_bgr = bgr
+        return self.count, self.fps, w, h
 
     # -- cache ---------------------------------------------------------------
     def _cache_put(self, idx: int, bgr: np.ndarray) -> None:
@@ -537,6 +686,16 @@ class VideoReader:
         hit = self._cache_get(index)
         if hit is not None:
             return hit
+        if self.is_sequence:
+            files = getattr(self.cap, "files", [])
+            if not files:
+                return None
+            bgr = read_image_bgr(files[min(index, len(files) - 1)])
+            if bgr is None:
+                return self._last_bgr
+            self._cache_put(index, bgr)
+            self._last_idx, self._last_bgr = index, bgr
+            return bgr
         if self._last_idx < index <= self._last_idx + self.FORWARD_DECODE:
             bgr = self._decode_forward_to(index)
         else:
@@ -570,6 +729,8 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
 def _is_image_path(p: str | Path) -> bool:
     """True if `p` looks like a still image InkIt can open as a drawable canvas."""
+    if "#" in Path(str(p)).name:
+        return False  # image-sequence pattern, opened like a clip
     return str(p).lower().endswith(IMAGE_EXTS)
 
 
@@ -706,6 +867,9 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "queue_panel": "Ctrl+L",
     "time_mode": "Ctrl+T",
     "goto_frame": "Ctrl+G",
+    "export_frames": "Ctrl+Shift+E",
+    "set_fps": "Ctrl+Alt+F",
+    "open_sequence": "Ctrl+Alt+O",
     "add_note": "N",
     "add_range_note": "Shift+N",
     "notes_panel": "Ctrl+Shift+N",
@@ -754,6 +918,9 @@ ACTION_LABELS: dict[str, str] = {
     "queue_panel": "Shot list",
     "time_mode": "Frames / time display",
     "goto_frame": "Go to frame…",
+    "export_frames": "Export annotated frames…",
+    "set_fps": "Frame rate…",
+    "open_sequence": "Open image sequence…",
     "add_note": "Add note…",
     "add_range_note": "Add range note…",
     "notes_panel": "Review Notes panel",
@@ -801,6 +968,9 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "queue_panel": "Show or hide the shot list panel",
     "time_mode": "Switch timeline between frames and timecode",
     "goto_frame": "Type a frame number to jump to",
+    "export_frames": "Write every drawn / noted frame as PNG plus a contact sheet",
+    "set_fps": "Override the playback / export frame rate",
+    "open_sequence": "Open a numbered PNG / JPG / EXR / TIFF sequence as a clip",
     "add_note": "Add a typed note on the current frame",
     "add_range_note": "Add a typed note spanning a frame range",
     "notes_panel": "Show / hide the typed review notes sidebar",
@@ -4540,9 +4710,11 @@ class ExportWorker(QThread):
                     "-c:a", "aac", "-b:a", "192k", "-shortest", self.dest]
         else:
             cmd += [*vcodec, self.dest]
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            return 1, "Could not open source video."
+        cap = VideoReader()
+        try:
+            cap.open(self.video_path)
+        except Exception:
+            return 1, "Could not open source media."
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -4551,13 +4723,13 @@ class ExportWorker(QThread):
             creationflags=flags,
         )
         i = 0
-        total = int(self.project.frame_count or cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
+        total = int(self.project.frame_count or cap.count or 1)
         self.progress.emit(1)
         try:
             assert proc.stdin is not None
-            while True:
-                ok, frame = cap.read()
-                if not ok:
+            while i < total:
+                frame = cap.frame(i)
+                if frame is None:
                     break
                 if frame.shape[1] != w or frame.shape[0] != h:
                     frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
@@ -4588,17 +4760,20 @@ class ExportWorker(QThread):
                 pass
             return 1, str(e)
         finally:
-            cap.release()
+            cap.close()
 
     def run(self) -> None:
-        probe = cv2.VideoCapture(self.video_path)
-        if not probe.isOpened():
-            self.failed.emit("Could not open source video.")
+        probe = VideoReader()
+        try:
+            _n, native_fps, w, h = probe.open(self.video_path)
+        except Exception:
+            self.failed.emit("Could not open source media.")
             return
-        fps = probe.get(cv2.CAP_PROP_FPS) or self.project.fps
-        w = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        probe.release()
+        probe.close()
+        # Honour a user frame-rate override (and image sequences, which have none)
+        fps = float(self.project.fps or native_fps or 24.0)
+        if is_sequence_path(self.video_path) or getattr(self.project, "fps_override", None):
+            self.export_audio = False
         if w % 2:
             w -= 1
         if h % 2:
@@ -6323,6 +6498,7 @@ class MainWindow(QMainWindow):
         m = self.menuBar()
         file_m = m.addMenu("File")
         file_m.addAction(self._act("open_video", self.open_video))
+        file_m.addAction(self._act("open_sequence", self.open_sequence))
         file_m.addAction(self._act("open_scene", self.open_scene))
         file_m.addAction(self._act("save_scene", self.save_scene))
         file_m.addSeparator()
@@ -6333,6 +6509,7 @@ class MainWindow(QMainWindow):
         self._rebuild_autosave_menu()
         file_m.addSeparator()
         file_m.addAction(self._act("export", self.export_video))
+        file_m.addAction(self._act("export_frames", self.export_annotated_frames))
         file_m.addAction(self._act("export_review", self.export_review_sheet))
         file_m.addSeparator()
         file_m.addAction(self._act("quit", self.close))
@@ -6369,6 +6546,7 @@ class MainWindow(QMainWindow):
         self.act_notes_panel.setCheckable(True)
         view.addAction(self.act_notes_panel)
         view.addAction(self._act("goto_frame", self._prompt_goto_frame))
+        view.addAction(self._act("set_fps", self._prompt_fps))
         view.addAction(self._act("start_frame", lambda: self.box_start.begin_edit()))
 
         self._act("pen", self._toggle_tool)  # B toggles pen <-> eraser
@@ -6798,17 +6976,103 @@ class MainWindow(QMainWindow):
                     self._player.stop()
                 except Exception:
                     pass
+        elif is_sequence_path(path):
+            if getattr(self, "_player", None) is not None:
+                try:
+                    self._player.stop()
+                    self._player.setSource(QUrl())
+                except Exception:
+                    pass
         else:
             self._load_clip_audio(path)
+        self.project.native_fps = float(fps)
+        self.project.fps_override = None
+        saved_fps = (self._settings.get("fps_overrides", {}) or {}).get(self._notes_key(path)) if path else None
+        if saved_fps:
+            self._apply_fps(float(saved_fps), remember=False)
         self._show_frame(0)
         self._refresh_marks()
-        if still:
-            self.lbl_meta.setText(f"{w}×{h}   image")
-        else:
-            fps_txt = f"{fps:.3f}".rstrip("0").rstrip(".")
-            self.lbl_meta.setText(f"{w}×{h}   {fps_txt} fps")
+        self._update_meta_label()
         self.setWindowTitle(f"InkIt — {Path(path).name}")
         self._load_maya_offset_for_path(path)
+
+    def _update_meta_label(self) -> None:
+        w, h = int(self.project.width or 0), int(self.project.height or 0)
+        if self._is_still:
+            self.lbl_meta.setText(f"{w}×{h}   image")
+            return
+        fps_txt = f"{float(self.project.fps or 24.0):.3f}".rstrip("0").rstrip(".")
+        kind = "   seq" if is_sequence_path(self.project.path) else ""
+        star = "*" if self.project.fps_override else ""
+        self.lbl_meta.setText(f"{w}×{h}   {fps_txt}{star} fps{kind}")
+
+    def _apply_fps(self, fps: float | None, remember: bool = True) -> None:
+        """Sets (or clears with None) the frame-rate override for the current clip."""
+        native = float(getattr(self.project, "native_fps", self.project.fps) or 24.0)
+        if fps is not None and abs(float(fps) - native) < 1e-6 and not is_sequence_path(self.project.path):
+            fps = None
+        self.project.fps_override = float(fps) if fps else None
+        self.project.fps = float(fps) if fps else native
+        path = getattr(self.project, "path", "") or ""
+        if remember and path:
+            fo = dict(self._settings.get("fps_overrides", {}) or {})
+            if fps:
+                fo[self._notes_key(path)] = float(fps)
+            else:
+                fo.pop(self._notes_key(path), None)
+            self._settings["fps_overrides"] = fo
+            self._schedule_save()
+            self._autosave_timer.start(250)
+        # Audio is timed by the media's own rate: retimed playback runs silent
+        if path and not is_sequence_path(path) and not self._is_still and getattr(self, "_player", None) is not None:
+            try:
+                if self.project.fps_override:
+                    self._player.stop()
+                    self._player.setSource(QUrl())
+                elif self._player.source().isEmpty():
+                    self._load_clip_audio(path)
+            except Exception:
+                pass
+        if self.playing:
+            self.play_timer.start(max(8, int(1000 / max(self.project.fps, 1))))
+        self._update_meta_label()
+        self._update_time_label()
+
+    def _prompt_fps(self) -> None:
+        if not self._clip_open() or self._is_still:
+            return
+        native = float(getattr(self.project, "native_fps", self.project.fps) or 24.0)
+        nat_txt = f"{native:.3f}".rstrip("0").rstrip(".")
+        items = [f"Native ({nat_txt})", "12", "23.976", "24", "25", "29.97", "30", "48", "50", "60", "Custom…"]
+        cur = f"{float(self.project.fps):.3f}".rstrip("0").rstrip(".") if self.project.fps_override else items[0]
+        idx = items.index(cur) if cur in items else 0
+        choice, ok = QInputDialog.getItem(self, "Frame rate", "Playback / export frame rate:", items, idx, False)
+        if not ok:
+            return
+        if choice.startswith("Native"):
+            self._apply_fps(None)
+        elif choice.startswith("Custom"):
+            val, ok = QInputDialog.getDouble(self, "Frame rate", "Frames per second:", float(self.project.fps), 1.0, 240.0, 3)
+            if ok:
+                self._apply_fps(float(val))
+        else:
+            self._apply_fps(float(choice))
+        self.statusBar().showMessage(f"Frame rate: {self.project.fps:g} fps" + ("  (override — audio muted)" if self.project.fps_override and not is_sequence_path(self.project.path) else ""), 4000)
+
+    def open_sequence(self) -> None:
+        """Pick any frame of a numbered PNG/JPG/EXR/TIFF sequence."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open image sequence (pick any frame)", self._open_start_dir(),
+            "Image sequences (*.png *.jpg *.jpeg *.exr *.tif *.tiff *.bmp);;All files (*.*)"
+        )
+        if not path:
+            return
+        pat = sequence_pattern_for(path)
+        if not pat:
+            QMessageBox.information(self, "Image sequence", "No numbered sibling frames found — opening as a still image.")
+            self._set_queue([path])
+            return
+        self._set_queue([pat])
 
     def _notes_key(self, p: str) -> str:
         try:
@@ -7071,7 +7335,7 @@ class MainWindow(QMainWindow):
 
     def _set_queue(self, paths: list[str]) -> None:
         """Adds `paths` to the shot list (deduped); opens the first new one if nothing is open."""
-        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p)]
+        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p) or is_sequence_path(p)]
         if not fresh:
             return
         if self.queue_paths:
@@ -7093,7 +7357,7 @@ class MainWindow(QMainWindow):
 
     def _append_to_queue(self, paths: list[str]) -> None:
         """Adds files to the shot list (deduped) without opening/switching clips."""
-        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p)]
+        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p) or is_sequence_path(p)]
         if not fresh:
             return
         known = {str(Path(p).resolve()).lower() for p in self.queue_paths}
@@ -7107,7 +7371,7 @@ class MainWindow(QMainWindow):
 
     def _replace_queue(self, paths: list[str]) -> None:
         """Swaps the whole list (used by Open list) and opens the first entry."""
-        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p)]
+        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p) or is_sequence_path(p)]
         self.queue_paths = fresh
         self.queue_index = -1
         self._queue_refresh()
@@ -7181,7 +7445,12 @@ class MainWindow(QMainWindow):
         pm = QPixmap()
         ext = Path(path).suffix.lower()
         try:
-            if ext in (".mp4", ".mov") and cv2 is not None:
+            if is_sequence_path(path):
+                files, _first = sequence_files(path)
+                fr = read_image_bgr(files[len(files) // 10]) if files else None
+                if fr is not None:
+                    pm = QPixmap.fromImage(bgr_to_qimage(fr))
+            elif ext in (".mp4", ".mov") and cv2 is not None:
                 cap = cv2.VideoCapture(path)
                 n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(n * 0.1)))
@@ -7224,7 +7493,7 @@ class MainWindow(QMainWindow):
             return
         path = self.queue_paths[index]
         ext = Path(path).suffix.lower()
-        if ext in (".mp4", ".mov"):
+        if ext in (".mp4", ".mov") or is_sequence_path(path):
             ok = self._open_video_path(path)
         elif _is_image_path(path):
             ok = self._open_image_path(path)
@@ -7689,7 +7958,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Save scene", "Open a video first.")
             return
         folder = self._save_start_dir() or str(Path.home() / "Documents")
-        name = (Path(self.project.path).stem if self.project.path else "board") + ".inkit"
+        name = (media_stem(self.project.path) if self.project.path else "board") + ".inkit"
         if (
             self.project.scene_path
             and Path(self.project.scene_path).is_file()
@@ -7730,7 +7999,12 @@ class MainWindow(QMainWindow):
             if not url.isLocalFile():
                 continue
             p = url.toLocalFile()
-            if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p):
+            if Path(p).is_dir():
+                seq = sequence_in_folder(p)
+                if seq:
+                    out.append(seq)
+                continue
+            if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p) or is_sequence_path(p):
                 out.append(p)
         return out
 
@@ -8014,6 +8288,95 @@ class MainWindow(QMainWindow):
         rows.sort(key=lambda r: (r["start"], r["end"]))
         return rows
 
+    def export_annotated_frames(self, folder: str | None = None) -> list[str]:
+        """Writes every drawn / noted frame as <stem>.<frame>.png (display frame
+        numbers, drawings burned in) plus <stem>_contact_sheet.png."""
+        if not self._clip_open():
+            QMessageBox.information(self, "Export frames", "Open a clip first.")
+            return []
+        self.canvas._end()
+        frames = sorted(set(self.project.annotated_frames()) | {int(n["start"]) for n in self.project.text_notes})
+        if not frames:
+            QMessageBox.information(self, "Export frames", "No drawn or noted frames to export yet.")
+            return []
+        if folder is None:
+            start_dir = self._settings.get("last_export_dir") or self._save_start_dir() or str(Path.home())
+            folder = QFileDialog.getExistingDirectory(self, "Export annotated frames to folder", start_dir)
+            if not folder:
+                return []
+        out_dir = Path(folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = media_stem(self.project.path)
+        pad = max(4, len(str(self.project.display_frame(max(self.project.frame_count - 1, 0)))))
+        reader = self._open_export_reader()
+        prog = QProgressDialog("Exporting annotated frames…", "Cancel", 0, len(frames) + 1, self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(300)
+        written: list[str] = []
+        tiles: list[tuple[np.ndarray, str]] = []
+        try:
+            for k, f in enumerate(frames):
+                if prog.wasCanceled():
+                    break
+                prog.setValue(k)
+                img = self._render_export_frame(f, reader)
+                num = self.project.display_frame(f)
+                dest = out_dir / f"{stem}.{num:0{pad}d}.png"
+                if cv2.imwrite(str(dest), img):
+                    written.append(str(dest))
+                label = str(num)
+                txt = " / ".join(n.get("text", "").strip() for n in self.project.notes_at(f) if n.get("text", "").strip())
+                tiles.append((img, f"{label}   {txt}" if txt else label))
+            if tiles:
+                sheet = self._contact_sheet(tiles, title=Path(self.project.path).name if self.project.path else "Drawing board")
+                cs = out_dir / f"{stem}_contact_sheet.png"
+                if sheet.save(str(cs), "PNG"):
+                    written.append(str(cs))
+        finally:
+            if reader is not None:
+                reader.close()
+            prog.close()
+        self._settings["last_export_dir"] = str(out_dir)
+        self._schedule_save()
+        self.statusBar().showMessage(f"Exported {len(written)} files to {out_dir}", 5000)
+        return written
+
+    def _contact_sheet(self, tiles: list[tuple[np.ndarray, str]], title: str = "", cols: int = 4, tile_w: int = 480) -> QImage:
+        """Grid of annotated thumbnails with frame numbers / notes underneath."""
+        h0, w0 = tiles[0][0].shape[:2]
+        tile_h = max(1, int(round(h0 * tile_w / max(w0, 1))))
+        cols = max(1, min(cols, len(tiles)))
+        rows = (len(tiles) + cols - 1) // cols
+        gap, cap_h, head_h = 16, 44, 56
+        W = cols * tile_w + (cols + 1) * gap
+        H = head_h + rows * (tile_h + cap_h + gap) + gap
+        sheet = QImage(W, H, QImage.Format.Format_RGB32)
+        sheet.fill(QColor("#1a1a1c"))
+        p = QPainter(sheet)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        f = QFont()
+        f.setPixelSize(22)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor("#f2f3f7"))
+        p.drawText(QRectF(gap, 0, W - 2 * gap, head_h), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                   f"{title}   ·   {len(tiles)} frames   ·   {time.strftime('%Y-%m-%d')}")
+        f.setPixelSize(15)
+        f.setBold(False)
+        p.setFont(f)
+        for i, (img, label) in enumerate(tiles):
+            r, c = divmod(i, cols)
+            x = gap + c * (tile_w + gap)
+            y = head_h + r * (tile_h + cap_h + gap)
+            thumb = cv2.resize(img, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+            p.drawImage(QRectF(x, y, tile_w, tile_h), bgr_to_qimage(thumb))
+            p.setPen(QColor("#33d6ff"))
+            p.drawText(QRectF(x, y + tile_h + 4, tile_w, cap_h - 4),
+                       int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap), label)
+        p.end()
+        return sheet
+
     def export_review_sheet(self, dest: str | None = None) -> str | None:
         """Writes <name>.csv and <name>.html (thumbnails embedded) for all notes."""
         if not self._clip_open():
@@ -8024,7 +8387,7 @@ class MainWindow(QMainWindow):
         if not rows:
             QMessageBox.information(self, "Review sheet", "No notes or drawings to export yet.")
             return None
-        stem = Path(self.project.path).stem if self.project.path else "board"
+        stem = media_stem(self.project.path) if self.project.path else "board"
         if dest is None:
             export_dir = self._settings.get("last_export_dir") or self._save_start_dir()
             default = str(Path(export_dir or Path.home()) / f"{stem}_review.html")
@@ -9143,7 +9506,7 @@ Start-Sleep -Milliseconds 80
             QMessageBox.critical(self, "Export", "FFmpeg was not found. Install FFmpeg and try again.")
             return
         export_dir = self._settings.get("last_export_dir") or self._save_start_dir()
-        default = str(Path(export_dir or Path(self.project.path).parent) / (Path(self.project.path).stem + "_notes.mp4"))
+        default = str(Path(export_dir or Path(self.project.path).parent) / (media_stem(self.project.path) + "_notes.mp4"))
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export video with notes",
@@ -9177,7 +9540,7 @@ Start-Sleep -Milliseconds 80
     def _export_still_image(self) -> None:
         """Exports the annotated image (strokes baked in) as PNG/JPG."""
         export_dir = self._settings.get("last_export_dir") or self._save_start_dir()
-        default = str(Path(export_dir or Path(self.project.path).parent) / (Path(self.project.path).stem + "_notes.png"))
+        default = str(Path(export_dir or Path(self.project.path).parent) / (media_stem(self.project.path) + "_notes.png"))
         path, _ = QFileDialog.getSaveFileName(
             self, "Export image with notes", default,
             "PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp)"
@@ -9397,7 +9760,7 @@ Start-Sleep -Milliseconds 80
                 menu.addAction(act)
 
     def _open_recent_open(self, path: str) -> None:
-        if not Path(path).is_file():
+        if not media_exists(path):
             QMessageBox.warning(self, "Recent", f"File not found:\n{path}")
             items = [p for p in self._settings.get("recent_open", []) if p != path]
             self._settings["recent_open"] = items
@@ -9436,7 +9799,7 @@ Start-Sleep -Milliseconds 80
             if self._bind_board_data(proj, path):
                 self._settings["last_open_dir"] = str(Path(path).parent)
             return
-        if not video or not Path(video).is_file():
+        if not video or not media_exists(video):
             QMessageBox.warning(self, "Open scene", "Scene loaded, but the clip was not found. Choose the media file.")
             video, _ = QFileDialog.getOpenFileName(
                 self, "Locate clip for this scene", self._open_start_dir(),
@@ -9451,6 +9814,8 @@ Start-Sleep -Milliseconds 80
             ok = self._open_video_path(proj.path, strokes=proj.strokes)
         if ok:
             self.project.text_notes = list(proj.text_notes)
+            if proj.fps_override:
+                self._apply_fps(float(proj.fps_override), remember=False)
             self._refresh_marks()
             if "start_frame" in data:
                 self.project.start_frame = int(data.get("start_frame") or 0)
@@ -9692,7 +10057,7 @@ Start-Sleep -Milliseconds 80
         ):
             dest = Path(self.project.scene_path)
         else:
-            stem = Path(self.project.path).stem if self.project.path else "board"
+            stem = media_stem(self.project.path) if self.project.path else "board"
             dest = self.get_autosave_dir() / f"{stem}_autosave.inkit"
             if not self.project.user_saved:
                 self.project.scene_path = str(dest)

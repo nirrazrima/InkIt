@@ -22,7 +22,7 @@ import app  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _media import frame_id as block_id, make_h264  # noqa: E402
+from _media import frame_id as block_id, make_frame, make_h264, make_sequence  # noqa: E402
 
 
 def make_clip(path: Path, n: int = 48, fps: float = 24.0, size=(320, 180), gop: int = 0) -> None:
@@ -227,7 +227,86 @@ def test_text_notes(w, tmp: Path, qapp) -> None:
     check(html_txt.count("data:image/jpeg;base64,") == 3 and "arc is floaty" in html_txt, "HTML sheet embeds 3 thumbnails")
 
 
-FEATURE_TESTS = [test_frame_accurate_seek, test_start_frame, test_text_notes]
+def test_sequences_fps_frames(w, tmp: Path, qapp) -> None:
+    """Image sequences (PNG, gaps, EXR), fps override, annotated-frame + contact sheet export."""
+    seq_dir = tmp / "seq"
+    first = make_sequence(seq_dir, "sh040_anim", start=1001, n=12)
+    (seq_dir / "sh040_anim.1005.png").unlink()  # a gap: frame 1005 holds 1004
+    pat = app.sequence_pattern_for(first)
+    check(pat is not None and pat.endswith("sh040_anim.####.png"), f"sequence pattern detected ({pat})")
+    check(app.sequence_in_folder(seq_dir) == pat, "dropping the folder finds the sequence")
+    w._settings.setdefault("start_frames", {}).pop(w._notes_key(pat), None)
+    w._settings.setdefault("fps_overrides", {}).pop(w._notes_key(pat), None)
+    w._set_queue([pat])
+    w._queue_open(w.queue_paths.index(pat))
+    check(w.reader.is_sequence and w.project.frame_count == 12, f"sequence opened as 12-frame clip ({w.project.frame_count})")
+    check(w.project.start_frame == 1001 and w.lbl_time.text() == "Frame 1001 / 1012", f"start frame from sequence numbering ({w.lbl_time.text()})")
+    ids = [block_id(w.reader.frame(i)) for i in range(12)]
+    check(ids == [0, 1, 2, 3, 3, 5, 6, 7, 8, 9, 10, 11], f"sequence frames in order, gap holds previous ({ids})")
+
+    w._apply_fps(12.0)
+    check(w.project.fps == 12.0 and w.project.fps_override == 12.0 and "12* fps" in w.lbl_meta.text(), f"fps override applied ({w.lbl_meta.text()})")
+    w.project.strokes_at(2).append(app.Stroke(color="#ff00ff", base_width=10.0, points=[app.Point(0.1, 0.5, 1.0), app.Point(0.9, 0.5, 1.0)]))
+    w.project.text_notes.append({"start": 7, "end": 7, "text": "ease out"})
+    scene = tmp / "sh040.inkit"
+    scene.write_text(json.dumps(w.project.to_json()), encoding="utf-8")
+    w._apply_fps(None)
+    w._open_scene_path(str(scene))
+    check(w.reader.is_sequence and w.project.fps == 12.0 and w.project.annotated_frames() == [2], "sequence scene round-trip keeps fps override + drawings")
+
+    out = w.export_annotated_frames(str(tmp / "frames"))
+    names = sorted(Path(x).name for x in out)
+    check(names == ["sh040_anim.1003.png", "sh040_anim.1008.png", "sh040_anim_contact_sheet.png"], f"annotated frames exported with display numbers ({names})")
+    png = cv2.imread(str(tmp / "frames" / "sh040_anim.1003.png"))
+    check(png is not None and int(png[90, 160, 2]) > 200 and int(png[90, 160, 1]) < 80, "exported PNG has the drawing burned in")
+    sheet = cv2.imread(str(tmp / "frames" / "sh040_anim_contact_sheet.png"))
+    check(sheet is not None and sheet.shape[1] > 900, f"contact sheet written ({None if sheet is None else sheet.shape})")
+
+    # Video export of a sequence (ffmpeg, no audio) at the override rate
+    dest = tmp / "sh040_notes.mp4"
+    wk = app.ExportWorker(w.project.path, w.project, str(dest), export_audio=True,
+                          strokes_snapshot={k: list(v) for k, v in w.project.strokes.items()}, overlay_snapshot=[])
+    res: list[str] = []
+    wk.failed.connect(lambda m: res.append("fail:" + m))
+    wk.finished_ok.connect(lambda d: res.append("ok"))
+    wk.run()
+    cap = cv2.VideoCapture(str(dest))
+    n, fps = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    check(res == ["ok"] and n == 12 and abs(fps - 12.0) < 0.01, f"sequence exported to MP4 at 12 fps ({res}, {n} frames, {fps})")
+
+    # Regression: plain video export still works through the new reader
+    vclip = tmp / "sh041.mp4"
+    make_h264(vclip, n=30, gop=250)
+    w._open_video_path(str(vclip))
+    vdest = tmp / "sh041_notes.mp4"
+    wk = app.ExportWorker(w.project.path, w.project, str(vdest), export_audio=True, strokes_snapshot={}, overlay_snapshot=[])
+    res2: list[str] = []
+    wk.finished_ok.connect(lambda d: res2.append("ok"))
+    wk.failed.connect(lambda m: res2.append("fail:" + m))
+    wk.run()
+    cap = cv2.VideoCapture(str(vdest))
+    frames = [block_id(cap.read()[1]) for _ in range(30)]
+    cap.release()
+    check(res2 == ["ok"] and frames == list(range(30)), f"video export keeps every frame in order ({res2})")
+
+    # EXR (float, linear) if this OpenCV build has OpenEXR
+    exr_dir = tmp / "exr"
+    exr_dir.mkdir()
+    okexr = True
+    for k in range(3):
+        lin = (make_frame(k).astype(np.float32) / 255.0) ** 2.2
+        okexr = okexr and bool(cv2.imwrite(str(exr_dir / f"plate.{k + 1:04d}.exr"), lin))
+    if okexr:
+        r = app.VideoReader()
+        r.open(str(exr_dir / "plate.####.exr"))
+        check(r.seq_start == 1 and [block_id(r.frame(i)) for i in range(3)] == [0, 1, 2], "EXR sequence decodes (linear -> sRGB)")
+        r.close()
+    else:
+        print("skip  EXR (this OpenCV build has no OpenEXR writer)")
+
+
+FEATURE_TESTS = [test_frame_accurate_seek, test_start_frame, test_text_notes, test_sequences_fps_frames]
 
 
 def main() -> int:
