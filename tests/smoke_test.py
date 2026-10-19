@@ -306,7 +306,43 @@ def test_sequences_fps_frames(w, tmp: Path, qapp) -> None:
         print("skip  EXR (this OpenCV build has no OpenEXR writer)")
 
 
-FEATURE_TESTS = [test_frame_accurate_seek, test_start_frame, test_text_notes, test_sequences_fps_frames]
+def test_compare(w, tmp: Path, qapp) -> None:
+    """A/B compare: frame lock by number, wipe / side modes, drawings stay on A."""
+    a = tmp / "sh050_v001.1001-1060.mp4"
+    make_h264(a, n=60, gop=250)
+    bdir = tmp / "b"
+    make_sequence(bdir, "sh050_v002", start=1011, n=40)
+    w._settings.get("start_frames", {}).pop(w._notes_key(str(a)), None)
+    w._open_video_path(str(a))
+    check(w.project.start_frame == 1001, "A start 1001")
+    check(w.load_compare_clip(str(bdir / "sh050_v002.1020.png")), "load B from any sequence frame")
+    check(w.compare_start == 1011 and w.canvas.compare_mode == "wipe", "B start 1011 detected, wipe mode on")
+    w._show_frame(25)  # A frame 1026 -> B frame 1026 -> B index 15
+    check(block_id(w.compare_reader.frame(w.compare_index_for(25))) == 15, "B locked to A by frame number (1026)")
+    w._show_frame(0)   # A 1001 is before B starts: B holds its first frame
+    check(w.compare_index_for(0) == 0, "B clamps before its first frame")
+    w.project.strokes_at(30).append(app.Stroke(color="#ffcc00", base_width=12.0, points=[app.Point(0.05, 0.5, 1.0), app.Point(0.95, 0.5, 1.0)]))
+    w._show_frame(30)
+    qapp.processEvents()
+    shots = tmp / "shots"
+    shots.mkdir(exist_ok=True)
+    w.sl_wipe.setValue(35)
+    w.grab().save(str(shots / "compare_wipe.png"))
+    full = w.canvas._dst
+    w._set_compare_mode("side")
+    qapp.processEvents()
+    w.canvas.repaint()
+    check(w.canvas._dst.width() < full.width() * 0.75, "side-by-side puts A in the left half")
+    w.grab().save(str(shots / "compare_side.png"))
+    w._set_compare_mode("off")
+    qapp.processEvents()
+    w.canvas.repaint()
+    check(abs(w.canvas._dst.width() - full.width()) < 2, "A only restores the full view")
+    w.close_compare()
+    check(w.canvas.compare_image is None and not w._compare_bar.isVisible(), "close compare")
+
+
+FEATURE_TESTS = [test_frame_accurate_seek, test_start_frame, test_text_notes, test_sequences_fps_frames, test_compare]
 
 
 def main() -> int:

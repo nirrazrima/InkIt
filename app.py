@@ -867,6 +867,8 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "queue_panel": "Ctrl+L",
     "time_mode": "Ctrl+T",
     "goto_frame": "Ctrl+G",
+    "compare_mode": "Ctrl+Shift+C",
+    "compare_load": "Ctrl+Shift+B",
     "export_frames": "Ctrl+Shift+E",
     "set_fps": "Ctrl+Alt+F",
     "open_sequence": "Ctrl+Alt+O",
@@ -918,6 +920,8 @@ ACTION_LABELS: dict[str, str] = {
     "queue_panel": "Shot list",
     "time_mode": "Frames / time display",
     "goto_frame": "Go to frame…",
+    "compare_mode": "Compare mode (wipe / side by side / off)",
+    "compare_load": "Compare A/B: load B…",
     "export_frames": "Export annotated frames…",
     "set_fps": "Frame rate…",
     "open_sequence": "Open image sequence…",
@@ -968,6 +972,8 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "queue_panel": "Show or hide the shot list panel",
     "time_mode": "Switch timeline between frames and timecode",
     "goto_frame": "Type a frame number to jump to",
+    "compare_mode": "Cycle the A/B compare view",
+    "compare_load": "Load a second clip / sequence to compare against, frame-locked",
     "export_frames": "Write every drawn / noted frame as PNG plus a contact sheet",
     "set_fps": "Override the playback / export frame rate",
     "open_sequence": "Open a numbered PNG / JPG / EXR / TIFF sequence as a clip",
@@ -3445,6 +3451,11 @@ class Canvas(QWidget):
         self.notes_visible = True           # Master visibility toggle for annotations
         self.frame_overlay = False          # HUD frame counter (never exported)
         self.frame_overlay_text = ""
+        # A/B compare: B frame shown via wipe or side-by-side; drawings stay on A
+        self.compare_image: QImage | None = None
+        self.compare_mode = "off"      # 'off' | 'wipe' | 'side'
+        self.compare_wipe = 0.5        # wipe split position across A (0..1)
+        self.compare_labels = ("A", "B")
         self.theme = dict(THEMES["dark"])   # Active palette for painted chrome
         self.current_frame = 0              # Currently displayed frame index
         self._dst = QRectF()                # Video drawing rect inside canvas viewport
@@ -3688,6 +3699,62 @@ class Canvas(QWidget):
             self._overlay_n = total
 
 
+    def _compare_active(self) -> bool:
+        return self.compare_mode in ("wipe", "side") and self.compare_image is not None and not self.compare_image.isNull()
+
+    def _layout_rect(self) -> QRect:
+        """Viewport area for clip A: the left half in side-by-side compare."""
+        r = self.rect()
+        if self.compare_mode == "side" and self._compare_active():
+            return QRect(r.x(), r.y(), r.width() // 2 - 2, r.height())
+        return r
+
+    def _compare_side_rect(self) -> QRectF:
+        """Letterboxed rect for clip B in the right half (side-by-side)."""
+        r = self.rect()
+        half = QRectF(r.x() + r.width() // 2 + 2, r.y(), r.width() - r.width() // 2 - 2, r.height())
+        img = self.compare_image
+        sc = min(half.width() / max(img.width(), 1), half.height() / max(img.height(), 1))
+        w, h = img.width() * sc, img.height() * sc
+        return QRectF(half.x() + (half.width() - w) / 2, half.y() + (half.height() - h) / 2, w, h)
+
+    def _draw_compare(self, p: QPainter) -> None:
+        """Paints clip B (wipe over A's rect, or in the right half) plus A/B badges."""
+        if not self._compare_active() or self._dst.isEmpty():
+            return
+        if self.compare_mode == "wipe":
+            x = self._dst.x() + self._dst.width() * min(max(self.compare_wipe, 0.0), 1.0)
+            clip = QRectF(x, self._dst.y(), self._dst.right() - x, self._dst.height())
+            p.save()
+            p.setClipRect(clip)
+            p.drawImage(self._dst, self.compare_image)
+            p.restore()
+            p.setPen(QPen(QColor("#ffffff"), 2))
+            p.drawLine(QPointF(x, self._dst.top()), QPointF(x, self._dst.bottom()))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#ffffff"))
+            p.drawEllipse(QPointF(x, self._dst.center().y()), 6, 6)
+            a_box = QPointF(self._dst.x() + 10, self._dst.bottom() - 34)
+            b_box = QPointF(self._dst.right() - 10, self._dst.bottom() - 34)
+        else:
+            br = self._compare_side_rect()
+            p.drawImage(br, self.compare_image)
+            a_box = QPointF(self._dst.x() + 10, self._dst.bottom() - 34)
+            b_box = QPointF(br.right() - 10, br.bottom() - 34)
+        f = self.font()
+        f.setBold(True)
+        f.setPointSize(10)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        for (pt, text, right) in ((a_box, self.compare_labels[0], False), (b_box, self.compare_labels[1], True)):
+            tw = fm.horizontalAdvance(text) + 14
+            rect = QRectF(pt.x() - tw if right else pt.x(), pt.y(), tw, 24)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 160))
+            p.drawRoundedRect(rect, 4, 4)
+            p.setPen(QColor("#ffcc00") if not right else QColor("#33d6ff"))
+            p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), text)
+
     def _fit(self) -> QRectF:
         """Calculates letterboxed rectangle preserving media aspect ratio, with zoom/pan applied."""
         if self.is_board:
@@ -3697,7 +3764,7 @@ class Canvas(QWidget):
             return QRectF()
         else:
             iw, ih = self.image.width(), self.image.height()
-        wr = self.rect()
+        wr = self._layout_rect()
         scale = min(wr.width() / max(iw, 1), wr.height() / max(ih, 1))
         w, h = iw * scale, ih * scale
         x = wr.x() + (wr.width() - w) / 2
@@ -3749,6 +3816,7 @@ class Canvas(QWidget):
             p.setOpacity(self.clip_opacity)
             p.drawImage(self._dst, self.image)
             p.setOpacity(1.0)
+            self._draw_compare(p)
         elif self.is_board:
             # Blank drawing board: solid page in the board background color
             if not self._dst.isEmpty():
@@ -3905,7 +3973,7 @@ class Canvas(QWidget):
             return
         pw = max(2, int(self.project.width or 1920))
         ph = max(2, int(self.project.height or 1080))
-        wr = self.rect()
+        wr = self._layout_rect()
         scale0 = min(wr.width() / max(pw, 1), wr.height() / max(ph, 1))
         base_w = max(1.0, float(pw) * scale0)
         wscale = float(pw) / base_w  # doc px per screen px at unzoomed fit
@@ -6446,6 +6514,7 @@ class MainWindow(QMainWindow):
         self.lbl_meta.setStyleSheet("color: #bbb;")
         play.addWidget(self.lbl_meta)
 
+        layout.addWidget(self._build_compare_bar())
         layout.addWidget(play_wrap)
 
     def _act(self, key: str, slot) -> QAction:
@@ -6547,6 +6616,9 @@ class MainWindow(QMainWindow):
         view.addAction(self.act_notes_panel)
         view.addAction(self._act("goto_frame", self._prompt_goto_frame))
         view.addAction(self._act("set_fps", self._prompt_fps))
+        view.addSeparator()
+        view.addAction(self._act("compare_load", self.load_compare_clip))
+        view.addAction(self._act("compare_mode", self._cycle_compare_mode))
         view.addAction(self._act("start_frame", lambda: self.box_start.begin_edit()))
 
         self._act("pen", self._toggle_tool)  # B toggles pen <-> eraser
@@ -7588,6 +7660,8 @@ class MainWindow(QMainWindow):
         self.btn_play.setIcon(self._play_icon(False))
         self._update_time_label()
         self._refresh_marks()
+        if getattr(self, "compare_path", None):
+            self.close_compare()
 
     def _queue_clear(self) -> None:
         self.queue_paths = []
@@ -8070,12 +8144,165 @@ class MainWindow(QMainWindow):
             self.slider.blockSignals(True)
             self.slider.setValue(index)
             self.slider.blockSignals(False)
+        self._update_compare_frame(index)
         self._update_time_label()
         if not self.playing and not getattr(self, "_maya_sync_guard", False):
             self._sync_audio()
         self._maybe_send_to_maya(index)
         self._push_app_frame(index)
 
+
+    # -----------------------------------------------------------------------
+    # A/B compare (frame-locked second clip, wipe or side by side)
+    # -----------------------------------------------------------------------
+
+    def _build_compare_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("compareBar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(10, 2, 10, 2)
+        lay.setSpacing(8)
+        self.lbl_compare = QLabel("B: —")
+        self.lbl_compare.setStyleSheet("color:#33d6ff; font-weight:bold;")
+        lay.addWidget(self.lbl_compare)
+        self._compare_btns: dict[str, QPushButton] = {}
+        for key, text, tip in (("wipe", "Wipe", "Wipe: A left of the split, B right"),
+                               ("side", "Side by side", "A on the left, B on the right"),
+                               ("off", "A only", "Hide B (keep it loaded)")):
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setToolTip(tip)
+            b.setStatusTip(tip)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, k=key: self._set_compare_mode(k))
+            lay.addWidget(b)
+            self._compare_btns[key] = b
+        self.sl_wipe = BoxSlider("Wipe", 0, 100, 50)
+        self.sl_wipe.setToolTip("Wipe position — click or drag")
+        self.sl_wipe.valueChanged.connect(self._set_compare_wipe)
+        lay.addWidget(self.sl_wipe)
+        self.box_compare_start = FrameNumberBox("B start", 0)
+        self.box_compare_start.setToolTip("First frame number of clip B — B is locked to A by frame number (click to type, drag to scrub)")
+        self.box_compare_start.valueChanged.connect(self._set_compare_start)
+        lay.addWidget(self.box_compare_start)
+        btn_swap = QPushButton("Load B…")
+        btn_swap.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_swap.clicked.connect(self.load_compare_clip)
+        lay.addWidget(btn_swap)
+        btn_close = QPushButton("✕")
+        btn_close.setToolTip("Close compare")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(self.close_compare)
+        lay.addWidget(btn_close)
+        lay.addStretch(1)
+
+        def restyle() -> None:
+            c = self._colors()
+            bar.setStyleSheet(
+                f"#compareBar {{ background: {c['panel']}; }}"
+                f"#compareBar QPushButton {{ background: {c['card']}; border: 1px solid {c['border']};"
+                f" color: {c['text']}; padding: 4px 10px; border-radius: 4px; }}"
+                f"#compareBar QPushButton:checked {{ background: {c['accent']}; border-color: {c['accent']}; color: white; }}"
+                f"#compareBar QPushButton:hover {{ background: {c['card_hover']}; }}"
+            )
+
+        restyle()
+        self._dyn_styles.append(restyle)
+        bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        bar.setVisible(False)
+        self._compare_bar = bar
+        self.compare_reader = VideoReader()
+        self.compare_path: str | None = None
+        self.compare_start = 0
+        return bar
+
+    def load_compare_clip(self, path: str | None = None) -> bool:
+        """Loads clip B (video, sequence pattern or a frame of a sequence)."""
+        if not self._clip_open() or self._is_still or getattr(self.canvas, "is_board", False):
+            QMessageBox.information(self, "Compare A/B", "Open a video or image sequence (A) first.")
+            return False
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Load clip B to compare", self._open_start_dir(),
+                "Clips / sequences (*.mp4 *.mov *.MP4 *.MOV *.png *.jpg *.jpeg *.exr *.tif *.tiff);;All files (*.*)"
+            )
+            if not path:
+                return False
+        if not is_sequence_path(path) and Path(path).suffix.lower() in SEQUENCE_EXTS:
+            path = sequence_pattern_for(path) or path
+        try:
+            if _is_image_path(path):
+                raise RuntimeError("Pick a video or an image sequence frame for B.")
+            self.compare_reader.open(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Compare A/B", str(e))
+            return False
+        self.compare_path = path
+        b_start = self.compare_reader.seq_start
+        if b_start is None:
+            b_start = detect_start_frame(path)
+        # Unnumbered B: lock frame-for-frame to A (same start number)
+        self.compare_start = int(b_start) if b_start is not None else int(self.project.start_frame)
+        self.box_compare_start.setValue(self.compare_start, emit=False)
+        self.lbl_compare.setText(f"B: {Path(path).name}")
+        self.canvas.compare_labels = (f"A  {media_stem(self.project.path)}", f"B  {media_stem(path)}")
+        self._compare_bar.setVisible(True)
+        if self.canvas.compare_mode == "off":
+            self._set_compare_mode(self._settings.get("compare_mode", "wipe") if self._settings.get("compare_mode") in ("wipe", "side") else "wipe")
+        else:
+            self._set_compare_mode(self.canvas.compare_mode)
+        return True
+
+    def close_compare(self) -> None:
+        self.compare_reader.close()
+        self.compare_path = None
+        self.canvas.compare_image = None
+        self.canvas.compare_mode = "off"
+        if hasattr(self, "_compare_bar"):
+            self._compare_bar.setVisible(False)
+        self.canvas._cache_key = None
+        self.canvas.update()
+
+    def _set_compare_mode(self, mode: str) -> None:
+        if mode not in ("off", "wipe", "side"):
+            mode = "off"
+        self.canvas.compare_mode = mode
+        if mode != "off":
+            self._settings["compare_mode"] = mode
+        for k, b in self._compare_btns.items():
+            b.setChecked(k == mode)
+        self.sl_wipe.setVisible(mode == "wipe")
+        self.canvas._cache_key = None  # layout changed: rebuild stroke cache
+        self._update_compare_frame(self.canvas.current_frame)
+        self.canvas.update()
+
+    def _cycle_compare_mode(self) -> None:
+        if not self.compare_path:
+            self.load_compare_clip()
+            return
+        order = ["wipe", "side", "off"]
+        cur = self.canvas.compare_mode if self.canvas.compare_mode in order else "off"
+        self._set_compare_mode(order[(order.index(cur) + 1) % len(order)])
+
+    def _set_compare_wipe(self, v: int) -> None:
+        self.canvas.compare_wipe = max(0, min(100, int(v))) / 100.0
+        self.canvas.update()
+
+    def _set_compare_start(self, v: int) -> None:
+        self.compare_start = int(v)
+        self._update_compare_frame(self.canvas.current_frame)
+        self.canvas.update()
+
+    def compare_index_for(self, a_index: int) -> int:
+        """B frame index shown with A frame `a_index` (locked by frame NUMBER)."""
+        b = self.project.display_frame(a_index) - int(self.compare_start)
+        return max(0, min(b, max(self.compare_reader.count - 1, 0)))
+
+    def _update_compare_frame(self, a_index: int) -> None:
+        if not self.compare_path or self.compare_reader.cap is None or self.canvas.compare_mode == "off":
+            return
+        bgr = self.compare_reader.frame(self.compare_index_for(a_index))
+        self.canvas.compare_image = bgr_to_qimage(bgr) if bgr is not None else None
 
     # -----------------------------------------------------------------------
     # Typed review notes (per frame / range) + sidebar + review sheet
