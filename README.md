@@ -47,6 +47,16 @@ If you are an UI/UX artists and interested in the tool please get in touch to ma
 - Control how it looks: **Notes opacity** and **Clip opacity** (fade the underlying picture so your marks pop), and a **show/hide notes** toggle.
 - Persist your work in a lightweight scene file that opens right back up with all frames and strokes intact — with **autosave** in the background so you never lose work.
 
+### Review tools
+- **Start frame number**: the **Start** field next to the frame counter sets the first frame number of the clip (0, 1, 1001, 6586…). Click it to type a value, or click-drag left/right to scrub it (Shift ×10, Ctrl fine, wheel ±1). It is auto-detected from image-sequence numbering and from names like `shot.1001-1100.mov` or `shot_fr6586.mov`, saved in the scene, remembered per clip, and used by the counter, the frame HUD, **Go to frame** (`Ctrl+G`), notes, exports and Maya sync (with a numbered clip, Maya frame 1001 = InkIt frame 1001).
+- **Typed review notes**: `N` adds a note; its From / To frame fields default to the current frame (click to type or drag to make it a range, also when editing). Notes appear as a caption on the canvas, as cyan ticks on the timeline and in the **Review Notes** sidebar (`Ctrl+Shift+N`; click = jump, double-click = edit, Del = remove). They are saved in the `.inkit` scene (older scenes still open).
+- **Review sheet** (`Ctrl+Shift+R`): exports a CSV plus an HTML page with an annotated thumbnail for every note and every drawn frame.
+- **Annotated frames + contact sheet** (`Ctrl+Shift+E`): writes every drawn / noted frame as `shot.1001.png` (real frame numbers, drawings burned in) plus `shot_contact_sheet.png`.
+- **A/B compare** (`Ctrl+Shift+B` to load B, `Ctrl+Shift+C` to cycle): wipe or side-by-side against a second clip or sequence, locked by frame number (B has its own **B start**); your drawings stay on A.
+- **Image sequences** (`Ctrl+Alt+O`, or drop a folder): numbered PNG / JPG / TIFF / EXR frames open as a clip; missing numbers hold the previous frame. EXR is shown linear → sRGB.
+- **Frame rate override** (`Ctrl+Alt+F`): set playback / export fps (sequences default to 24). Saved per scene; a retimed video plays without audio.
+- **Frame-accurate seeking**: random access is verified by frame timestamps and backed by a small frame cache, so long-GOP H.264 playblasts land on the exact frame when scrubbing, stepping or syncing with Maya.
+
 ### Sync to Maya for animation review
 - InkIt and Autodesk Maya talk over a local two-way connection, letting you review animation directly against a frame-accurate playblast while keeping both apps in sync.
 - Use the **InkIt Sync** panel/shelf button in Maya to match InkIt to Maya's current frame — live, including during playback or scrubbing — with a configurable **frame offset** so Maya frames map exactly to your InkIt frames (offsets are remembered per scene).
@@ -74,7 +84,7 @@ If you are an UI/UX artists and interested in the tool please get in touch to ma
 
 ## Quick start
 
-**Fully compiled, no dependencies:** download the latest `InkIt.exe` from **Releases** and run it. Just double-click — that's it.
+**Fully compiled, no dependencies:** download the latest `InkIt.exe` from **Releases** (published automatically for every `v*` tag), or grab the `InkIt-exe` artifact from the latest **Actions ▸ Build InkIt.exe** run. Just double-click — that's it.
 
 **Run from source (developers):**
 ```
@@ -82,7 +92,7 @@ python app.py
 ```
 or double-click `Launch InkIt.vbs` / `Launch InkIt.bat` if you're running from a clone.
 
-**Open media:** hit `Ctrl+O` and pick an `.mp4`, `.mov`, or a still image (`.png`/`.jpg`/`.jpeg`/`.bmp`/`.webp`), or drop a file onto the window. Open saved scenes with `Ctrl+Shift+O`.
+**Open media:** hit `Ctrl+O` and pick an `.mp4`, `.mov`, or a still image (`.png`/`.jpg`/`.jpeg`/`.bmp`/`.webp`), or drop a file onto the window. Image sequences: `Ctrl+Alt+O` (pick any frame) or drop the folder. Open saved scenes with `Ctrl+Shift+O`.
 
 **Start drawing:** pick the pen, choose a color and size, and draw. Use `Space` to play, `Left`/`Right` to step frames, and `Down`/`Up` to jump between drawings.
 
@@ -101,19 +111,29 @@ or double-click `Launch InkIt.vbs` / `Launch InkIt.bat` if you're running from a
 
 - **Windows** (64-bit). 
 - **Compiled executable:** none — everything is bundled (Python, Qt, OpenCV, and FFmpeg are embedded).
-- **From source:** Python 3 with PySide6, OpenCV, numpy, and QtMultimedia (see `requirements.txt`).
+- **From source:** Python 3 with PySide6, OpenCV 4.x (EXR support), numpy, imageio-ffmpeg and QtMultimedia (see `requirements.txt`).
+- **Tests:** `QT_QPA_PLATFORM=offscreen python tests/smoke_test.py` (headless; generates its own test clips and sequences).
 
 ---
 
 ## Building from source
 
-The executable is built once with PyInstaller from the bundled spec and released to **Releases**. If you edit the source and want to rebuild, run:
+The single self-contained `InkIt.exe` is built with PyInstaller from `InkIt.spec` (onefile; bundles Python, Qt, OpenCV, `ffmpeg.exe` from imageio-ffmpeg, the `icons/` folder, the app icons and the Maya sync scripts).
+
+On Windows, just run:
 
 ```
-pyinstaller --clean --noconfirm InkIt.spec
+build.bat
 ```
 
----
+It creates/uses `.venv`, installs `requirements.txt`, runs a compile check and then `pyinstaller --clean --noconfirm InkIt.spec`. The result is `dist\InkIt.exe`.
+
+CI: `.github/workflows/build.yml` (currently staged as `ci/build.yml` — move it into `.github/workflows/` to enable it) builds the exe on `windows-latest` for every push / pull request (download it from the run's **Artifacts**), runs a headless smoke test, and publishes a GitHub Release with the exe attached when you push a tag such as `v1.2.0`:
+
+```
+git tag v1.2.0
+git push origin v1.2.0
+```
 
 ## Notes
 

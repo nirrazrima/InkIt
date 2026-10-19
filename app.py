@@ -17,7 +17,7 @@ ARCHITECTURE & COMPONENT MAP:
    - Project: Video metadata, frame count, FPS, per-frame stroke map, JSON I/O
 
 3. VIDEO DECODING & HELPERS
-   - VideoReader: OpenCV VideoCapture wrapper with single-frame caching
+   - VideoReader: frame-accurate OpenCV reader (timestamp-verified seeks + LRU frame cache)
    - bgr_to_qimage(): Fast color conversion from OpenCV BGR to Qt QImage
    - config_dir(): Roaming application data directory (%APPDATA%/InkIt)
    - DEFAULT_SHORTCUTS & ACTION_LABELS: Global keyboard shortcut maps
@@ -72,15 +72,20 @@ ARCHITECTURE & COMPONENT MAP:
 
 from __future__ import annotations
 
+import base64
+import csv
 import ctypes
+import html
 import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -96,6 +101,9 @@ if "__compiled__" in globals():
         except OSError:
             pass
 
+# OpenEXR decoding in OpenCV 4.x is opt-in and must be enabled before import.
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
 import cv2
 import numpy as np
 from PySide6.QtCore import (
@@ -105,6 +113,7 @@ from PySide6.QtCore import (
     QPointF,
     QRect,
     QRectF,
+    QSettings,
     QSize,
     Qt,
     QThread,
@@ -123,6 +132,7 @@ from PySide6.QtGui import (
     QGuiApplication,
     QIcon,
     QImage,
+    QIntValidator,
     QKeySequence,
     QPainter,
     QPainterPath,
@@ -143,6 +153,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDockWidget,
     QFileDialog,
     QFrame,
     QGroupBox,
@@ -157,6 +168,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QSplitter,
     QProgressDialog,
     QPushButton,
@@ -271,6 +283,27 @@ class Project:
         # Always-visible overlay layer (arcs / tracking marks) drawn on top of
         # every frame; NOT tied to any specific frame.
         self.overlay_strokes: list[Stroke] = []
+        # First frame NUMBER shown to the user (0, 1, 1001, 6586, ...). Frames
+        # stay 0-based internally; only display / export / Maya use the offset.
+        self.start_frame: int = 0
+        # Typed review notes: [{"start": f0, "end": f1, "text": "..."}] with
+        # 0-based inclusive frame range (start == end for a single frame).
+        self.text_notes: list[dict] = []
+        # User frame-rate override (None = use the media's own rate)
+        self.fps_override: float | None = None
+        self.native_fps: float = 24.0
+
+    def notes_at(self, f: int) -> list[dict]:
+        """Typed notes whose frame range covers frame `f`."""
+        return [n for n in self.text_notes if int(n["start"]) <= int(f) <= int(n["end"])]
+
+    def noted_frames(self) -> list[int]:
+        """First frame of every typed note (timeline markers)."""
+        return sorted({int(n["start"]) for n in self.text_notes})
+
+    def display_frame(self, f: int) -> int:
+        """User-facing frame number for internal 0-based frame `f`."""
+        return int(f) + int(self.start_frame)
 
     def strokes_at(self, f: int) -> list[Stroke]:
         return self.strokes.setdefault(f, [])
@@ -299,6 +332,12 @@ class Project:
             "height": self.height,
             "strokes": {str(k): [stroke_d(s) for s in v] for k, v in self.strokes.items() if v},
             "overlay_strokes": [stroke_d(s) for s in self.overlay_strokes],
+            "start_frame": int(self.start_frame),
+            "fps_override": self.fps_override,
+            "text_notes": [
+                {"start": int(n["start"]), "end": int(n["end"]), "text": str(n.get("text", ""))}
+                for n in self.text_notes
+            ],
         }
 
     def load_json(self, data: dict, scene_dir: Path | None = None) -> None:
@@ -306,11 +345,11 @@ class Project:
         video = data.get("video") or ""
         if video:
             p = Path(video)
-            if not p.is_file() and scene_dir is not None:
+            if not media_exists(p) and scene_dir is not None:
                 alt = scene_dir / p.name
-                if alt.is_file():
+                if media_exists(alt):
                     p = alt
-            self.path = str(p) if p.is_file() else video
+            self.path = str(p) if media_exists(p) else video
         # Restore timeline geometry so media-less board scenes reopen correctly
         if data.get("fps"):
             self.fps = float(data["fps"])
@@ -320,6 +359,18 @@ class Project:
             self.width = int(data["width"])
         if data.get("height"):
             self.height = int(data["height"])
+        # Older scenes have no start frame: they keep displaying from 0
+        self.start_frame = int(data.get("start_frame", 0) or 0)
+        fo = data.get("fps_override")
+        self.fps_override = float(fo) if fo else None
+        self.text_notes = []
+        for n in data.get("text_notes", []) or []:
+            try:
+                a, b = int(n["start"]), int(n.get("end", n["start"]))
+                self.text_notes.append({"start": min(a, b), "end": max(a, b), "text": str(n.get("text", ""))})
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.text_notes.sort(key=lambda n: (n["start"], n["end"]))
         for k, arr in data.get("strokes", {}).items():
             self.strokes[int(k)] = [
                 Stroke(
@@ -349,20 +400,160 @@ class Project:
 # 3. VIDEO DECODING & HELPERS
 # ===========================================================================
 
+SEQUENCE_EXTS = (".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff", ".bmp")
+_SEQ_RE = re.compile(r"^(?P<head>.*?)(?P<num>\d+)(?P<tail>\.[^.]+)$")
+
+
+def is_sequence_path(p: str | Path | None) -> bool:
+    """True for an image-sequence pattern such as 'shot.####.png'."""
+    return bool(p) and "#" in Path(str(p)).name
+
+
+def sequence_pattern_for(frame_file: str | Path) -> str | None:
+    """'shot.1001.png' -> 'shot.####.png' if at least 2 sibling frames exist."""
+    f = Path(frame_file)
+    m = _SEQ_RE.match(f.name)
+    if not m or f.suffix.lower() not in SEQUENCE_EXTS:
+        return None
+    pat = str(f.parent / f"{m.group('head')}{'#' * len(m.group('num'))}{m.group('tail')}")
+    return pat if len(sequence_files(pat)[0]) >= 2 else None
+
+
+def sequence_files(pattern: str | Path) -> tuple[list[str], int]:
+    """Frame files for a '#' pattern, one per frame NUMBER from first to last
+    (missing numbers hold the previous frame), plus the first frame number."""
+    pat = Path(str(pattern))
+    name = pat.name
+    i = name.index("#")
+    j = i
+    while j < len(name) and name[j] == "#":
+        j += 1
+    head, tail = name[:i], name[j:]
+    found: dict[int, str] = {}
+    try:
+        for f in pat.parent.iterdir():
+            n = f.name
+            if n.startswith(head) and n.endswith(tail) and len(n) > len(head) + len(tail):
+                mid = n[len(head):len(n) - len(tail)]
+                if mid.isdigit():
+                    found[int(mid)] = str(f)
+    except OSError:
+        return [], 0
+    if not found:
+        return [], 0
+    first, last = min(found), max(found)
+    files: list[str] = []
+    prev = found[first]
+    for k in range(first, last + 1):
+        prev = found.get(k, prev)
+        files.append(prev)
+    return files, first
+
+
+def sequence_in_folder(folder: str | Path) -> str | None:
+    """Pattern of the longest image sequence inside `folder`, if any."""
+    best: tuple[int, str] | None = None
+    seen: set[str] = set()
+    try:
+        for f in sorted(Path(folder).iterdir()):
+            pat = sequence_pattern_for(f) if f.is_file() else None
+            if pat and pat not in seen:
+                seen.add(pat)
+                n = len(sequence_files(pat)[0])
+                if best is None or n > best[0]:
+                    best = (n, pat)
+    except OSError:
+        return None
+    return best[1] if best else None
+
+
+def media_exists(p: str | Path | None) -> bool:
+    if not p:
+        return False
+    if is_sequence_path(p):
+        return bool(sequence_files(p)[0])
+    return Path(str(p)).is_file()
+
+
+def media_stem(p: str | Path | None) -> str:
+    """File stem for naming exports; 'shot.####.png' -> 'shot'."""
+    if not p:
+        return "board"
+    stem = Path(str(p)).stem
+    return stem.replace("#", "").rstrip("._- ") or "sequence"
+
+
+def read_image_bgr(path: str) -> np.ndarray | None:
+    """Reads PNG/JPG/TIFF/EXR as 8-bit BGR (EXR/float: linear -> sRGB, clipped)."""
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
+    if img is None:
+        return None
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[2] == 4:
+        img = img[:, :, :3]
+    if img.dtype == np.uint8:
+        return np.ascontiguousarray(img)
+    if img.dtype == np.uint16:
+        return (img >> 8).astype(np.uint8)
+    lin = np.clip(img.astype(np.float32), 0.0, 1.0)
+    srgb = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
+    return np.ascontiguousarray((srgb * 255.0 + 0.5).astype(np.uint8))
+
+
+class _SequenceCapture:
+    """Stand-in for cv2.VideoCapture over an image sequence (only release())."""
+
+    def __init__(self, files: list[str]) -> None:
+        self.files = files
+
+    def release(self) -> None:
+        self.files = []
+
+    def isOpened(self) -> bool:
+        return bool(self.files)
+
+
 class VideoReader:
     """
-    Fast, frame-accurate video frame reader using OpenCV VideoCapture.
-    Maintains a single-frame cache to prevent redundant seeks and decodes.
+    Frame-accurate video frame reader using OpenCV VideoCapture.
+
+    Seeking strategy (robust against long-GOP / B-frame H.264, MOV edit lists
+    and backends whose CAP_PROP_POS_FRAMES seeks land a few frames off):
+      * Sequential next frame / short forward hops are decoded forward.
+      * Random access seeks a little BEFORE the target (pre-roll), then decodes
+        forward, identifying every decoded frame by its presentation timestamp
+        (CAP_PROP_POS_MSEC) rather than trusting the seek. If the seek landed
+        past the target the pre-roll grows; as a last resort the file is
+        re-opened and decoded from frame 0.
+      * Every frame decoded on the way is kept in a small LRU cache, so
+        stepping backwards right after a seek is instant.
     """
+    PREROLL = 12            # frames decoded before a random-access target
+    FORWARD_DECODE = 48     # forward hops up to this many frames never seek
+    CACHE_BYTES = 384 * 1024 * 1024
+
     def __init__(self) -> None:
         self.cap: cv2.VideoCapture | None = None
         self.path: str | None = None
+        self.fps: float = 24.0
+        self.count: int = 0
         self._last_idx = -1
         self._last_bgr: np.ndarray | None = None
+        self._t0_ms = 0.0
+        self._ts_ok = True
+        self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self._cache_max = 64
+        self.is_sequence = False
+        self.seq_start: int | None = None  # first frame number of an image sequence
 
     def open(self, path: str) -> tuple[int, float, int, int]:
-        """Opens video file and returns (frame_count, fps, width, height)."""
+        """Opens a video file or image-sequence pattern; returns (frame_count, fps, width, height)."""
         self.close()
+        if is_sequence_path(path):
+            return self._open_sequence(path)
+        self.is_sequence = False
+        self.seq_start = None
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video:\n{path}")
@@ -372,31 +563,149 @@ class VideoReader:
         fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
         if fps <= 1e-3:
             fps = 24.0
+        self.fps = float(fps)
         count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        # Timestamp of frame 0 — later frames are identified relative to it
+        self._t0_ms = 0.0
+        self._ts_ok = True
+        ok, bgr = cap.read()
+        if ok and bgr is not None:
+            self._t0_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+            self._last_idx = 0
+            self._last_bgr = bgr
+            frame_bytes = max(1, int(bgr.nbytes))
+            self._cache_max = int(min(max(self.CACHE_BYTES // frame_bytes, 8), 240))
+            self._cache_put(0, bgr)
+            # Backends without usable timestamps report a constant POS_MSEC;
+            # fall back to sequential counting for those.
+            ok2, bgr2 = cap.read()
+            if ok2 and bgr2 is not None:
+                ms2 = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                self._ts_ok = ms2 > self._t0_ms
+                self._last_idx = 1
+                self._last_bgr = bgr2
+                self._cache_put(1, bgr2)
+            if not w or not h:
+                h, w = bgr.shape[:2]
+        self.count = count
         return count, fps, w, h
 
+    def _open_sequence(self, pattern: str) -> tuple[int, float, int, int]:
+        files, first = sequence_files(pattern)
+        if not files:
+            raise RuntimeError(f"No frames found for image sequence:\n{pattern}")
+        bgr = read_image_bgr(files[0])
+        if bgr is None:
+            raise RuntimeError(f"Could not read image:\n{files[0]}")
+        self.cap = _SequenceCapture(files)  # type: ignore[assignment]
+        self.path = pattern
+        self.is_sequence = True
+        self.seq_start = int(first)
+        self.fps = 24.0
+        self.count = len(files)
+        h, w = bgr.shape[:2]
+        self._cache_max = int(min(max(self.CACHE_BYTES // max(1, bgr.nbytes), 8), 240))
+        self._cache_put(0, bgr)
+        self._last_idx = 0
+        self._last_bgr = bgr
+        return self.count, self.fps, w, h
+
+    # -- cache ---------------------------------------------------------------
+    def _cache_put(self, idx: int, bgr: np.ndarray) -> None:
+        self._cache[idx] = bgr
+        self._cache.move_to_end(idx)
+        while len(self._cache) > self._cache_max:
+            self._cache.popitem(last=False)
+
+    def _cache_get(self, idx: int) -> np.ndarray | None:
+        bgr = self._cache.get(idx)
+        if bgr is not None:
+            self._cache.move_to_end(idx)
+        return bgr
+
+    # -- decoding ------------------------------------------------------------
+    def _decoded_index(self, fallback: int) -> int:
+        """Index of the frame just returned by read(), from its timestamp."""
+        if self._ts_ok:
+            ms = self.cap.get(cv2.CAP_PROP_POS_MSEC) if self.cap is not None else -1.0
+            if ms is not None and ms >= 0.0:
+                return int(round((float(ms) - self._t0_ms) * self.fps / 1000.0))
+        return fallback
+
+    def _read_next(self) -> tuple[int, np.ndarray | None]:
+        """Decodes one frame forward; returns (index, bgr) and caches it."""
+        ok, bgr = self.cap.read()
+        if not ok or bgr is None:
+            return -1, None
+        idx = self._decoded_index(self._last_idx + 1)
+        self._last_idx = idx
+        self._last_bgr = bgr
+        self._cache_put(idx, bgr)
+        return idx, bgr
+
+    def _decode_forward_to(self, index: int) -> np.ndarray | None:
+        """Decodes forward from the current position until `index` is reached."""
+        guard = 0
+        while guard < 100000:
+            guard += 1
+            idx, bgr = self._read_next()
+            if bgr is None:
+                return None
+            if idx == index:
+                return bgr
+            if idx > index:
+                return None  # overshoot — caller re-seeks earlier
+        return None
+
+    def _seek_decode(self, index: int) -> np.ndarray | None:
+        preroll = self.PREROLL
+        for _attempt in range(3):
+            start = max(0, index - preroll)
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            self._last_idx = start - 1
+            bgr = self._decode_forward_to(index)
+            if bgr is not None:
+                return bgr
+            if start == 0:
+                break
+            preroll *= 4
+        # Last resort: re-open and decode from the very first frame.
+        self.cap.release()
+        self.cap = cv2.VideoCapture(self.path)
+        self._last_idx = -1
+        if not self.cap.isOpened():
+            return None
+        return self._decode_forward_to(index)
+
     def frame(self, index: int) -> np.ndarray | None:
-        """Retrieves raw BGR frame by index (0-based) with seek optimization."""
+        """Retrieves raw BGR frame by index (0-based), frame-accurately."""
         if self.cap is None:
             return None
-        index = max(0, index)
-        # Return cached frame if requested again
-        if index == self._last_idx and self._last_bgr is not None:
-            return self._last_bgr
-        # Only seek if not strictly sequential next frame
-        if index != self._last_idx + 1:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-        ok, bgr = self.cap.read()
-        if not ok:
-            # Fallback seek attempt
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-            ok, bgr = self.cap.read()
-            if not ok:
+        index = max(0, int(index))
+        hit = self._cache_get(index)
+        if hit is not None:
+            return hit
+        if self.is_sequence:
+            files = getattr(self.cap, "files", [])
+            if not files:
+                return None
+            bgr = read_image_bgr(files[min(index, len(files) - 1)])
+            if bgr is None:
                 return self._last_bgr
-        self._last_idx = index
-        self._last_bgr = bgr
+            self._cache_put(index, bgr)
+            self._last_idx, self._last_bgr = index, bgr
+            return bgr
+        if self._last_idx < index <= self._last_idx + self.FORWARD_DECODE:
+            bgr = self._decode_forward_to(index)
+        else:
+            bgr = None
+        if bgr is None:
+            bgr = self._seek_decode(index)
+        if bgr is None:
+            # Past the real end (container frame counts can over-report)
+            return self._last_bgr
         return bgr
 
     def close(self) -> None:
@@ -406,6 +715,7 @@ class VideoReader:
             self.cap = None
         self._last_idx = -1
         self._last_bgr = None
+        self._cache.clear()
 
 
 def bgr_to_qimage(bgr: np.ndarray) -> QImage:
@@ -420,7 +730,30 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
 def _is_image_path(p: str | Path) -> bool:
     """True if `p` looks like a still image InkIt can open as a drawable canvas."""
+    if "#" in Path(str(p)).name:
+        return False  # image-sequence pattern, opened like a clip
     return str(p).lower().endswith(IMAGE_EXTS)
+
+
+def detect_start_frame(path: str | Path | None) -> int | None:
+    """Best-effort start frame from a media file name, or None if unknown.
+
+    Recognised:  shot_010.1001-1100.mov  /  shot_1001-1100.mp4   -> 1001
+                 shot.f1001.mov / shot_fr6586.mov                -> 1001 / 6586
+    Image sequences report their first frame number elsewhere.
+    """
+    if not path:
+        return None
+    stem = Path(str(path)).stem
+    m = re.search(r"(?<!\d)(\d{1,7})\s*[-_]\s*(\d{1,7})$", stem)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if b > a:
+            return a
+    m = re.search(r"[._-](?:f|fr|frame)(\d{1,7})$", stem, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 DEFAULT_PRESSURE_CURVE = [[0.0, 0.02], [1.0, 1.0]]  # hairline at zero press -> full pen size
@@ -534,6 +867,16 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "frame_overlay": "Ctrl+Shift+H",
     "queue_panel": "Ctrl+L",
     "time_mode": "Ctrl+T",
+    "goto_frame": "Ctrl+G",
+    "compare_mode": "Ctrl+Shift+C",
+    "compare_load": "Ctrl+Shift+B",
+    "export_frames": "Ctrl+Shift+E",
+    "set_fps": "Ctrl+Alt+F",
+    "open_sequence": "Ctrl+Alt+O",
+    "add_note": "N",
+    "notes_panel": "Ctrl+Shift+N",
+    "export_review": "Ctrl+Shift+R",
+    "start_frame": "Ctrl+Shift+F",
     "show_thumbs": "Ctrl+Shift+T",
     "settings": "Ctrl+,",
     # -- Playback -----------------------------------------------------
@@ -576,6 +919,16 @@ ACTION_LABELS: dict[str, str] = {
     "frame_overlay": "Frame counter overlay",
     "queue_panel": "Shot list",
     "time_mode": "Frames / time display",
+    "goto_frame": "Go to frame…",
+    "compare_mode": "Compare mode (cycle)",
+    "compare_load": "Compare A/B: load B…",
+    "export_frames": "Export annotated frames…",
+    "set_fps": "Frame rate…",
+    "open_sequence": "Open image sequence…",
+    "add_note": "Add note…",
+    "notes_panel": "Review Notes panel",
+    "export_review": "Export review sheet…",
+    "start_frame": "Set start frame…",
     "show_thumbs": "Show thumbnails",
     "settings": "Settings…",
     "play_pause": "Play / pause",
@@ -617,6 +970,16 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "frame_overlay": "Frame counter badge in the canvas corner",
     "queue_panel": "Show or hide the shot list panel",
     "time_mode": "Switch timeline between frames and timecode",
+    "goto_frame": "Type a frame number to jump to",
+    "compare_mode": "Cycle the A/B compare view (wipe / side by side / overlay / B only / A only)",
+    "compare_load": "Load a second clip / sequence to compare against, frame-locked",
+    "export_frames": "Write every drawn / noted frame as PNG plus a contact sheet",
+    "set_fps": "Override the playback / export frame rate",
+    "open_sequence": "Open a numbered PNG / JPG / EXR / TIFF sequence as a clip",
+    "add_note": "Add a typed note on the current frame or a frame range",
+    "notes_panel": "Show / hide the typed review notes sidebar",
+    "export_review": "Export typed notes + drawn frames as CSV and an HTML sheet with thumbnails",
+    "start_frame": "Type the first frame number of this clip (e.g. 1001)",
     "show_thumbs": "Show or hide shot list thumbnails",
     "settings": "Open the settings dialog",
     "play_pause": "Play or pause playback",
@@ -688,6 +1051,7 @@ class TimelineSlider(QSlider):
     def __init__(self, orientation: Qt.Orientation, parent=None) -> None:
         super().__init__(orientation, parent)
         self.marks: set[int] = set()
+        self.note_marks: list[tuple[int, int]] = []  # typed-note (start, end) ranges
         self.setPageStep(1)
         self.setSingleStep(1)
 
@@ -736,10 +1100,17 @@ class TimelineSlider(QSlider):
             self.marks = nxt
             self.update()
 
+    def set_note_marks(self, ranges: list[tuple[int, int]]) -> None:
+        """Updates typed-note ranges drawn as cyan ticks under the groove."""
+        nxt = sorted((int(a), int(b)) for a, b in ranges)
+        if nxt != self.note_marks:
+            self.note_marks = nxt
+            self.update()
+
     def paintEvent(self, ev) -> None:
         """Paints standard slider groove/handle and overlays yellow drawing marker dots."""
         super().paintEvent(ev)
-        if not self.marks or self.maximum() <= self.minimum():
+        if (not self.marks and not self.note_marks) or self.maximum() <= self.minimum():
             return
         opt = QStyleOptionSlider()
         self.initStyleOption(opt)
@@ -758,6 +1129,13 @@ class TimelineSlider(QSlider):
         for f in self.marks:
             x = QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), int(f), int(span), False)
             p.drawEllipse(QPointF(x0 + x, groove.center().y()), 3.2, 3.2)
+        # Typed notes: cyan bar under the groove spanning the note's range
+        p.setBrush(QColor("#33d6ff"))
+        y = groove.center().y() + 6.0
+        for a, b in self.note_marks:
+            xa = QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), int(a), int(span), False)
+            xb = QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), int(min(b, self.maximum())), int(span), False)
+            p.drawRoundedRect(QRectF(x0 + xa - 2.5, y - 1.5, max(5.0, xb - xa + 5.0), 3.0), 1.5, 1.5)
         p.end()
 
 
@@ -1574,16 +1952,56 @@ class BoxSlider(QWidget):
         )
         self._label_w = 36 if icon else fm.horizontalAdvance(title)
         self._val_w = val_w
-        track_w = 59
+        # Value-only control (no track): [glyph/title] [value%]
         self.setFixedSize(
-            int(8 + self._label_w + 6 + track_w + 6 + val_w + 8),
+            int(8 + self._label_w + 6 + val_w + 8),
             36 if icon else 24,
         )
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._press_x = 0.0
         self._press_frac = 0.0
         self._press_value = 0
-        self._rel_drag = False
+        self._moved = False
+        self._edit = QLineEdit(self)
+        self._edit.setValidator(QIntValidator(self.minimum, self.maximum, self))
+        self._edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._edit.setStyleSheet(
+            "QLineEdit { background:#1e1e22; color:white; border:1px solid #5285a6;"
+            " border-radius:5px; font-weight:bold; padding:0 4px; }"
+        )
+        self._edit.hide()
+        self._edit.returnPressed.connect(self._commit_edit)
+        self._edit.editingFinished.connect(self._commit_edit)
+        self._edit.installEventFilter(self)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+
+    def begin_edit(self) -> None:
+        """Inline typing of the value (click without dragging)."""
+        x = 8.0 + float(self._label_w) + 2.0
+        self._edit.setGeometry(int(x), 2, int(self.width() - x - 4), self.height() - 4)
+        self._edit.setText(str(self._value))
+        self._edit.show()
+        self._edit.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._edit.selectAll()
+
+    def _commit_edit(self) -> None:
+        if not self._edit.isVisible():
+            return
+        txt = self._edit.text().strip()
+        self._edit.hide()
+        if txt and txt not in ("-", "+"):
+            try:
+                self.setValue(int(txt))
+            except ValueError:
+                pass
+
+    def eventFilter(self, obj, ev) -> bool:
+        if obj is self._edit and ev.type() == QEvent.Type.KeyPress and ev.key() == Qt.Key.Key_Escape:
+            self._edit.blockSignals(True)
+            self._edit.hide()
+            self._edit.blockSignals(False)
+            return True
+        return super().eventFilter(obj, ev)
 
     def _label(self) -> str:
         return f"{self.title} {self._value}{self.suffix}"
@@ -1643,21 +2061,9 @@ class BoxSlider(QWidget):
                 int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
                 self.title,
             )
-        tx0, tw = self._track_geom()
-        # trailing value in a fixed-width column so track geometry is stable
+        # trailing value only — the slider track/fill was removed
         val = self._label_value()
         vx = float(self.width()) - 8.0 - float(self._val_w)
-        frac = self._frac()
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#33343c"))
-        p.drawRoundedRect(QRectF(tx0, cy - 2.0, tw, 4.0), 2.0, 2.0)
-        fw = frac * tw
-        if fw > 0.5:
-            p.setBrush(QColor("#3d5afe"))
-            p.drawRoundedRect(QRectF(tx0, cy - 2.0, fw, 4.0), 2.0, 2.0)
-        p.setPen(QPen(QColor("#202028"), 1))
-        p.setBrush(QColor("#f2f3f7"))
-        p.drawEllipse(QPointF(tx0 + fw, cy), 5.0, 5.0)
         p.setPen(QColor("#eef0f5"))
         p.drawText(
             QRectF(vx, 0.0, float(self._val_w), h),
@@ -1665,54 +2071,26 @@ class BoxSlider(QWidget):
             val,
         )
 
-    def _track_geom(self) -> tuple[float, float]:
-        """Track x-start and width — the exact geometry used by painting."""
-        tx0 = 8.0 + float(self._label_w) + 6.0
-        tw = float(self.width()) - 8.0 - float(self._val_w) - 6.0 - tx0
-        return tx0, tw
-
-    def _raw_frac(self, x: float) -> float:
-        """Unclamped 0..1 position across the widget (relative-drag math)."""
-        m = 8.0
-        span = max(1.0, self.width() - 2 * m)
-        return (x - m) / span
-
-    def _frac_at(self, x: float) -> float:
-        return min(max(self._raw_frac(x), 0.0), 1.0)
-
-    def _value_at_frac(self, f: float) -> int:
-        return int(round(self.minimum + f * (self.maximum - self.minimum)))
-
     def mousePressEvent(self, ev) -> None:
         if ev.button() == Qt.MouseButton.LeftButton:
             self._drag = True
+            self._moved = False
             self._press_x = ev.position().x()
-            self._press_frac = self._frac_at(self._press_x)
             self._press_value = self._value
-            tx0, tw = self._track_geom()
-            if tw > 1 and tx0 - 4 <= self._press_x <= tx0 + tw + 4:
-                # Press on the track: knob jumps exactly under the pointer.
-                self._rel_drag = False
-                f = min(max((self._press_x - tx0) / tw, 0.0), 1.0)
-                self.setValue(self._value_at_frac(f))
-            else:
-                # Press on icon/label: no jump — drag adjusts from current %.
-                self._rel_drag = True
             ev.accept()
             return
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev) -> None:
         if self._drag:
-            if self._rel_drag:
-                # Relative from where it was; Ctrl = 1/8 fine-tune speed.
+            dx = ev.position().x() - self._press_x
+            if abs(dx) >= 3:
+                self._moved = True
+            if self._moved:
+                # Relative drag: full range over ~150 px; Ctrl = 1/8 fine-tune speed.
                 speed = 8.0 if (ev.modifiers() & Qt.KeyboardModifier.ControlModifier) else 1.0
-                df = (self._raw_frac(ev.position().x()) - self._press_frac) / speed
-                self.setValue(int(round(self._press_value + df * (self.maximum - self.minimum))))
-            else:
-                tx0, tw = self._track_geom()
-                f = min(max((ev.position().x() - tx0) / max(tw, 1.0), 0.0), 1.0)
-                self.setValue(self._value_at_frac(f))
+                span = max(1, self.maximum - self.minimum)
+                self.setValue(int(round(self._press_value + dx / 150.0 * span / speed)))
             ev.accept()
             return
         super().mouseMoveEvent(ev)
@@ -1720,6 +2098,8 @@ class BoxSlider(QWidget):
     def mouseReleaseEvent(self, ev) -> None:
         if self._drag:
             self._drag = False
+            if not self._moved:
+                self.begin_edit()
             ev.accept()
             return
         super().mouseReleaseEvent(ev)
@@ -2158,6 +2538,187 @@ class ValueBox(QWidget):
     def _refresh_button_states(self) -> None:
         self.plus_btn.setEnabled(self._value < self._max)
         self.minus_btn.setEnabled(self._value > self._min)
+
+
+class FrameNumberBox(QWidget):
+    """
+    Drag-to-edit frame number field (start frame), styled like ValueBox and
+    driven like BoxSlider's relative drag:
+      * click (no drag)  -> type a value inline, Enter/focus-out commits, Esc cancels
+      * click-drag left/right -> scrub the value (Shift = x10, Ctrl = fine)
+      * mouse wheel -> +/- 1
+    """
+
+    valueChanged = Signal(int)
+
+    PX_PER_STEP = 4.0
+
+    def __init__(self, caption: str = "Start", value: int = 0, minimum: int = -999999, maximum: int = 9999999, parent=None) -> None:
+        super().__init__(parent)
+        self._min = int(minimum)
+        self._max = int(maximum)
+        self._value = min(max(int(value), self._min), self._max)
+        self.caption = caption
+        self._drag = False
+        self._moved = False
+        self._press_x = 0.0
+        self._press_value = self._value
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "FrameNumberBox { background-color:#2b2b2b; border:1px solid #4a4a4a;"
+            " border-radius:6px; }"
+            "FrameNumberBox:hover { border-color:#5285a6; }"
+        )
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setFixedSize(92, 30)
+        self._edit = QLineEdit(self)
+        self._edit.setValidator(QIntValidator(self._min, self._max, self))
+        self._edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._edit.setStyleSheet(
+            "QLineEdit { background:#1e1e22; color:white; border:1px solid #5285a6;"
+            " border-radius:5px; font-size:12px; font-weight:bold; padding:0 6px; }"
+        )
+        self._edit.hide()
+        self._edit.returnPressed.connect(self._commit_edit)
+        self._edit.editingFinished.connect(self._commit_edit)
+        self._edit.installEventFilter(self)
+
+    def value(self) -> int:
+        return self._value
+
+    def setValue(self, v: int, emit: bool = True) -> None:
+        v = min(max(int(v), self._min), self._max)
+        if v == self._value:
+            return
+        self._value = v
+        self.update()
+        if emit:
+            self.valueChanged.emit(v)
+
+    # -- inline typing -----------------------------------------------------
+    def begin_edit(self) -> None:
+        self._edit.setGeometry(self.rect().adjusted(1, 1, -1, -1))
+        self._edit.setText(str(self._value))
+        self._edit.show()
+        self._edit.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._edit.selectAll()
+
+    def _commit_edit(self) -> None:
+        if not self._edit.isVisible():
+            return
+        txt = self._edit.text().strip()
+        self._edit.hide()
+        if txt and txt not in ("-", "+"):
+            try:
+                self.setValue(int(txt))
+            except ValueError:
+                pass
+
+    def eventFilter(self, obj, ev) -> bool:
+        if obj is self._edit and ev.type() == QEvent.Type.KeyPress and ev.key() == Qt.Key.Key_Escape:
+            self._edit.blockSignals(True)
+            self._edit.hide()
+            self._edit.blockSignals(False)
+            return True
+        return super().eventFilter(obj, ev)
+
+    # -- drag scrubbing ------------------------------------------------------
+    def mousePressEvent(self, ev) -> None:
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._drag = True
+            self._moved = False
+            self._press_x = ev.position().x()
+            self._press_value = self._value
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev) -> None:
+        if self._drag:
+            dx = ev.position().x() - self._press_x
+            if abs(dx) >= 3:
+                self._moved = True
+            if self._moved:
+                mods = ev.modifiers()
+                step = self.PX_PER_STEP
+                if mods & Qt.KeyboardModifier.ControlModifier:
+                    step *= 4.0
+                mult = 10 if (mods & Qt.KeyboardModifier.ShiftModifier) else 1
+                self.setValue(self._press_value + int(dx / step) * mult)
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if self._drag and ev.button() == Qt.MouseButton.LeftButton:
+            self._drag = False
+            if not self._moved:
+                self.begin_edit()
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
+    def wheelEvent(self, ev) -> None:
+        d = ev.angleDelta().y()
+        if d:
+            self.setValue(self._value + (1 if d > 0 else -1))
+            ev.accept()
+            return
+        super().wheelEvent(ev)
+
+    def paintEvent(self, ev) -> None:
+        super().paintEvent(ev)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(8, 0, -8, 0)
+        f = p.font()
+        f.setPointSizeF(max(7.0, f.pointSizeF() - 1.0))
+        p.setFont(f)
+        p.setPen(QColor("#8a8a95"))
+        p.drawText(r, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), self.caption)
+        f.setBold(True)
+        f.setPointSizeF(f.pointSizeF() + 1.0)
+        p.setFont(f)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(r, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), str(self._value))
+        p.end()
+
+
+class NoteDialog(QDialog):
+    """Typed review note editor: frame range (in displayed frame numbers) + text."""
+
+    def __init__(self, parent, first: int, last: int, start: int, end: int, text: str = "", title: str = "Review note") -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+        lay = QVBoxLayout(self)
+        row = QHBoxLayout()
+        # Same click-to-type / drag-to-scrub control as the Start frame box
+        self.sp_start = FrameNumberBox("From", int(start), int(first), int(last))
+        self.sp_end = FrameNumberBox("To", int(end), int(first), int(last))
+        for sp in (self.sp_start, self.sp_end):
+            sp.setFixedSize(110, 30)
+            sp.setToolTip("Frame number — click to type, drag left/right to scrub (Shift ×10)")
+        row.addWidget(self.sp_start)
+        row.addWidget(self.sp_end)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.edit = QPlainTextEdit()
+        self.edit.setPlainText(text)
+        self.edit.setPlaceholderText("e.g. hold this pose 2 more frames, softer ease into the contact…")
+        self.edit.setMinimumHeight(110)
+        lay.addWidget(self.edit, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self.sp_start.valueChanged.connect(lambda v: self.sp_end.setValue(max(self.sp_end.value(), v)))
+        self.sp_end.valueChanged.connect(lambda v: self.sp_start.setValue(min(self.sp_start.value(), v)))
+        self.edit.setFocus()
+
+    def result_values(self) -> tuple[int, int, str]:
+        a, b = int(self.sp_start.value()), int(self.sp_end.value())
+        return min(a, b), max(a, b), self.edit.toPlainText().strip()
 
 
 class VolumeButton(QPushButton):
@@ -2887,6 +3448,12 @@ class Canvas(QWidget):
         self.notes_visible = True           # Master visibility toggle for annotations
         self.frame_overlay = False          # HUD frame counter (never exported)
         self.frame_overlay_text = ""
+        # A/B compare: B frame shown via wipe or side-by-side; drawings stay on A
+        self.compare_image: QImage | None = None
+        self.compare_mode = "off"      # 'off' (A only) | 'bonly' | 'wipe' | 'side' | 'overlay'
+        self.compare_wipe = 0.5        # wipe split position across A (0..1)
+        self.compare_opacity = 0.5     # B opacity in overlay mode (0..1)
+        self.compare_labels = ("A", "B")
         self.theme = dict(THEMES["dark"])   # Active palette for painted chrome
         self.current_frame = 0              # Currently displayed frame index
         self._dst = QRectF()                # Video drawing rect inside canvas viewport
@@ -3130,6 +3697,74 @@ class Canvas(QWidget):
             self._overlay_n = total
 
 
+    def _compare_active(self) -> bool:
+        return self.compare_mode in ("wipe", "side", "bonly", "overlay") and self.compare_image is not None and not self.compare_image.isNull()
+
+    def _layout_rect(self) -> QRect:
+        """Viewport area for clip A: the left half in side-by-side compare."""
+        r = self.rect()
+        if self.compare_mode == "side" and self._compare_active():
+            return QRect(r.x(), r.y(), r.width() // 2 - 2, r.height())
+        return r
+
+    def _compare_side_rect(self) -> QRectF:
+        """Letterboxed rect for clip B in the right half (side-by-side)."""
+        r = self.rect()
+        half = QRectF(r.x() + r.width() // 2 + 2, r.y(), r.width() - r.width() // 2 - 2, r.height())
+        img = self.compare_image
+        sc = min(half.width() / max(img.width(), 1), half.height() / max(img.height(), 1))
+        w, h = img.width() * sc, img.height() * sc
+        return QRectF(half.x() + (half.width() - w) / 2, half.y() + (half.height() - h) / 2, w, h)
+
+    def _draw_compare(self, p: QPainter) -> None:
+        """Paints clip B (wipe over A's rect, or in the right half) plus A/B badges."""
+        if not self._compare_active() or self._dst.isEmpty():
+            return
+        if self.compare_mode in ("bonly", "overlay"):
+            p.save()
+            p.setOpacity(1.0 if self.compare_mode == "bonly" else min(max(self.compare_opacity, 0.0), 1.0))
+            p.drawImage(self._dst, self.compare_image)
+            p.restore()
+            a_box = QPointF(self._dst.x() + 10, self._dst.bottom() - 34)
+            b_box = QPointF(self._dst.right() - 10, self._dst.bottom() - 34)
+        elif self.compare_mode == "wipe":
+            x = self._dst.x() + self._dst.width() * min(max(self.compare_wipe, 0.0), 1.0)
+            clip = QRectF(x, self._dst.y(), self._dst.right() - x, self._dst.height())
+            p.save()
+            p.setClipRect(clip)
+            p.drawImage(self._dst, self.compare_image)
+            p.restore()
+            p.setPen(QPen(QColor("#ffffff"), 2))
+            p.drawLine(QPointF(x, self._dst.top()), QPointF(x, self._dst.bottom()))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#ffffff"))
+            p.drawEllipse(QPointF(x, self._dst.center().y()), 6, 6)
+            a_box = QPointF(self._dst.x() + 10, self._dst.bottom() - 34)
+            b_box = QPointF(self._dst.right() - 10, self._dst.bottom() - 34)
+        else:
+            br = self._compare_side_rect()
+            p.drawImage(br, self.compare_image)
+            a_box = QPointF(self._dst.x() + 10, self._dst.bottom() - 34)
+            b_box = QPointF(br.right() - 10, br.bottom() - 34)
+        f = self.font()
+        f.setBold(True)
+        f.setPointSize(10)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        badges = [(a_box, self.compare_labels[0], False), (b_box, self.compare_labels[1], True)]
+        if self.compare_mode == "bonly":
+            badges = badges[1:]
+        elif self.compare_mode == "overlay":
+            badges[1] = (b_box, f"{self.compare_labels[1]}  {int(round(self.compare_opacity * 100))}%", True)
+        for (pt, text, right) in badges:
+            tw = fm.horizontalAdvance(text) + 14
+            rect = QRectF(pt.x() - tw if right else pt.x(), pt.y(), tw, 24)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 160))
+            p.drawRoundedRect(rect, 4, 4)
+            p.setPen(QColor("#ffcc00") if not right else QColor("#33d6ff"))
+            p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), text)
+
     def _fit(self) -> QRectF:
         """Calculates letterboxed rectangle preserving media aspect ratio, with zoom/pan applied."""
         if self.is_board:
@@ -3139,7 +3774,7 @@ class Canvas(QWidget):
             return QRectF()
         else:
             iw, ih = self.image.width(), self.image.height()
-        wr = self.rect()
+        wr = self._layout_rect()
         scale = min(wr.width() / max(iw, 1), wr.height() / max(ih, 1))
         w, h = iw * scale, ih * scale
         x = wr.x() + (wr.width() - w) / 2
@@ -3191,6 +3826,7 @@ class Canvas(QWidget):
             p.setOpacity(self.clip_opacity)
             p.drawImage(self._dst, self.image)
             p.setOpacity(1.0)
+            self._draw_compare(p)
         elif self.is_board:
             # Blank drawing board: solid page in the board background color
             if not self._dst.isEmpty():
@@ -3265,7 +3901,33 @@ class Canvas(QWidget):
 
         # Frame counter HUD (screen-only; never part of exports)
         self._draw_frame_hud(p)
+        self._draw_text_notes(p)
         p.end()
+
+    def _draw_text_notes(self, p: QPainter) -> None:
+        """Typed review notes covering this frame, as a caption at the bottom-left."""
+        if not getattr(self, "show_text_notes", True) or self.project is None:
+            return
+        notes = self.project.notes_at(self.current_frame) if hasattr(self.project, "notes_at") else []
+        if not notes:
+            return
+        text = "\n".join(n.get("text", "").strip() for n in notes if n.get("text", "").strip())
+        if not text:
+            return
+        f = self.font()
+        f.setPointSize(max(10, int(self.height() / 52)))
+        p.setFont(f)
+        pad = 10
+        maxw = max(160.0, min(self.width() * 0.6, 720.0))
+        br = p.fontMetrics().boundingRect(QRect(0, 0, int(maxw), 4000), int(Qt.TextFlag.TextWordWrap), text)
+        box = QRectF(pad, self.height() - br.height() - pad * 3, br.width() + pad * 2, br.height() + pad)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 170))
+        p.drawRoundedRect(box, 5, 5)
+        p.setBrush(QColor("#33d6ff"))
+        p.drawRoundedRect(QRectF(box.x(), box.y(), 3.0, box.height()), 1.5, 1.5)
+        p.setPen(QColor("#f2f3f7"))
+        p.drawText(box.adjusted(pad, pad / 2, -pad / 2, -pad / 2), int(Qt.TextFlag.TextWordWrap), text)
 
     def _draw_frame_hud(self, p: QPainter) -> None:
         """Draws the frame counter badge (top-left). Skipped when disabled/empty."""
@@ -3321,7 +3983,7 @@ class Canvas(QWidget):
             return
         pw = max(2, int(self.project.width or 1920))
         ph = max(2, int(self.project.height or 1080))
-        wr = self.rect()
+        wr = self._layout_rect()
         scale0 = min(wr.width() / max(pw, 1), wr.height() / max(ph, 1))
         base_w = max(1.0, float(pw) * scale0)
         wscale = float(pw) / base_w  # doc px per screen px at unzoomed fit
@@ -4126,9 +4788,11 @@ class ExportWorker(QThread):
                     "-c:a", "aac", "-b:a", "192k", "-shortest", self.dest]
         else:
             cmd += [*vcodec, self.dest]
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            return 1, "Could not open source video."
+        cap = VideoReader()
+        try:
+            cap.open(self.video_path)
+        except Exception:
+            return 1, "Could not open source media."
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -4137,13 +4801,13 @@ class ExportWorker(QThread):
             creationflags=flags,
         )
         i = 0
-        total = int(self.project.frame_count or cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
+        total = int(self.project.frame_count or cap.count or 1)
         self.progress.emit(1)
         try:
             assert proc.stdin is not None
-            while True:
-                ok, frame = cap.read()
-                if not ok:
+            while i < total:
+                frame = cap.frame(i)
+                if frame is None:
                     break
                 if frame.shape[1] != w or frame.shape[0] != h:
                     frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
@@ -4174,17 +4838,20 @@ class ExportWorker(QThread):
                 pass
             return 1, str(e)
         finally:
-            cap.release()
+            cap.close()
 
     def run(self) -> None:
-        probe = cv2.VideoCapture(self.video_path)
-        if not probe.isOpened():
-            self.failed.emit("Could not open source video.")
+        probe = VideoReader()
+        try:
+            _n, native_fps, w, h = probe.open(self.video_path)
+        except Exception:
+            self.failed.emit("Could not open source media.")
             return
-        fps = probe.get(cv2.CAP_PROP_FPS) or self.project.fps
-        w = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        probe.release()
+        probe.close()
+        # Honour a user frame-rate override (and image sequences, which have none)
+        fps = float(self.project.fps or native_fps or 24.0)
+        if is_sequence_path(self.video_path) or getattr(self.project, "fps_override", None):
+            self.export_audio = False
         if w % 2:
             w -= 1
         if h % 2:
@@ -5421,6 +6088,7 @@ class MainWindow(QMainWindow):
         self._apply_settings_to_ui()
         self._apply_theme()
         self._build_menus()
+        self._build_notes_dock()
         self.statusBar().showMessage(
             "Middle-drag or scroll wheel to change frames."
         )
@@ -5837,6 +6505,12 @@ class MainWindow(QMainWindow):
         self.slider.valueChanged.connect(self._scrub)
         play.addWidget(self.slider, 1)
 
+        # --- [FIELD] Start frame number (click to type, drag to scrub) ---
+        self.box_start = FrameNumberBox("Start", 0)
+        self.box_start.setToolTip("Start frame number — click to type, drag left/right to scrub (Shift ×10, Ctrl fine)")
+        self.box_start.valueChanged.connect(self._set_start_frame)
+        play.addWidget(self.box_start)
+
         # --- [LABEL] Timecode / Frame Number Mode Display ---
         self.lbl_time = ClickableLabel("—")
         self.lbl_time.setMinimumWidth(150)
@@ -5850,6 +6524,7 @@ class MainWindow(QMainWindow):
         self.lbl_meta.setStyleSheet("color: #bbb;")
         play.addWidget(self.lbl_meta)
 
+        layout.addWidget(self._build_compare_bar())
         layout.addWidget(play_wrap)
 
     def _act(self, key: str, slot) -> QAction:
@@ -5902,6 +6577,7 @@ class MainWindow(QMainWindow):
         m = self.menuBar()
         file_m = m.addMenu("File")
         file_m.addAction(self._act("open_video", self.open_video))
+        file_m.addAction(self._act("open_sequence", self.open_sequence))
         file_m.addAction(self._act("open_scene", self.open_scene))
         file_m.addAction(self._act("save_scene", self.save_scene))
         file_m.addSeparator()
@@ -5912,6 +6588,8 @@ class MainWindow(QMainWindow):
         self._rebuild_autosave_menu()
         file_m.addSeparator()
         file_m.addAction(self._act("export", self.export_video))
+        file_m.addAction(self._act("export_frames", self.export_annotated_frames))
+        file_m.addAction(self._act("export_review", self.export_review_sheet))
         file_m.addSeparator()
         file_m.addAction(self._act("quit", self.close))
 
@@ -5923,6 +6601,8 @@ class MainWindow(QMainWindow):
         edit.addAction(ovl_clear)
         ovl_clear.setEnabled(bool(self.project is not None and self.project.overlay_strokes))
         self._ovl_clear_action = ovl_clear
+        edit.addSeparator()
+        edit.addAction(self._act("add_note", self.add_text_note))
         edit.addSeparator()
 
         view = m.addMenu("View")
@@ -5939,6 +6619,16 @@ class MainWindow(QMainWindow):
         self.act_fov.setCheckable(True)
         self.act_fov.setChecked(bool(self._settings.get("frame_overlay", False)))
         self.act_fov.toggled.connect(self._toggle_frame_overlay)
+        view.addSeparator()
+        self.act_notes_panel = self._act("notes_panel", lambda: self._toggle_notes_dock())
+        self.act_notes_panel.setCheckable(True)
+        view.addAction(self.act_notes_panel)
+        view.addAction(self._act("goto_frame", self._prompt_goto_frame))
+        view.addAction(self._act("set_fps", self._prompt_fps))
+        view.addSeparator()
+        view.addAction(self._act("compare_load", self.load_compare_clip))
+        view.addAction(self._act("compare_mode", self._cycle_compare_mode))
+        view.addAction(self._act("start_frame", lambda: self.box_start.begin_edit()))
 
         self._act("pen", self._toggle_tool)  # B toggles pen <-> eraser
         self._act("eraser", lambda: self._set_tool("eraser"))
@@ -6177,6 +6867,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_marks(self) -> None:
         self.slider.set_marks(self.project.annotated_frames())
+        self.slider.set_note_marks([(n["start"], n["end"]) for n in getattr(self.project, "text_notes", [])])
+        if hasattr(self, "notes_list"):
+            self._rebuild_notes_list()
 
     def goto_prev_drawing(self) -> None:
         frames = self.project.annotated_frames()
@@ -6322,6 +7015,10 @@ class MainWindow(QMainWindow):
     def _bind_new_project(self, path: str, count: int, fps: float, w: int, h: int, keep_strokes: dict | None = None) -> None:
         # Stash the outgoing media's drawings so switching shots never loses them
         old_path = getattr(self.project, "path", "")
+        if not hasattr(self, "_session_text_notes"):
+            self._session_text_notes: dict[str, list[dict]] = {}
+        if old_path and getattr(self.project, "text_notes", None):
+            self._session_text_notes[self._notes_key(old_path)] = list(self.project.text_notes)
         if old_path and not (bool(getattr(self.canvas, "is_board", False)) and not old_path):
             if any(s.points for lst in self.project.strokes.values() for s in lst):
                 self._session_notes[self._notes_key(old_path)] = dict(self.project.strokes)
@@ -6336,7 +7033,10 @@ class MainWindow(QMainWindow):
         self.project.height = h
         if keep_strokes is not None:
             self.project.strokes = keep_strokes
+        self.project.start_frame = self._initial_start_frame(path)
+        self.project.text_notes = list(self._session_text_notes.pop(self._notes_key(path), [])) if path else []
         self.canvas.project = self.project
+        self._sync_start_box()
         still = bool(self._is_still)
         board = bool(getattr(self.canvas, "is_board", False))
         self.slider.blockSignals(True)
@@ -6357,17 +7057,103 @@ class MainWindow(QMainWindow):
                     self._player.stop()
                 except Exception:
                     pass
+        elif is_sequence_path(path):
+            if getattr(self, "_player", None) is not None:
+                try:
+                    self._player.stop()
+                    self._player.setSource(QUrl())
+                except Exception:
+                    pass
         else:
             self._load_clip_audio(path)
+        self.project.native_fps = float(fps)
+        self.project.fps_override = None
+        saved_fps = (self._settings.get("fps_overrides", {}) or {}).get(self._notes_key(path)) if path else None
+        if saved_fps:
+            self._apply_fps(float(saved_fps), remember=False)
         self._show_frame(0)
         self._refresh_marks()
-        if still:
-            self.lbl_meta.setText(f"{w}×{h}   image")
-        else:
-            fps_txt = f"{fps:.3f}".rstrip("0").rstrip(".")
-            self.lbl_meta.setText(f"{w}×{h}   {fps_txt} fps")
+        self._update_meta_label()
         self.setWindowTitle(f"InkIt — {Path(path).name}")
         self._load_maya_offset_for_path(path)
+
+    def _update_meta_label(self) -> None:
+        w, h = int(self.project.width or 0), int(self.project.height or 0)
+        if self._is_still:
+            self.lbl_meta.setText(f"{w}×{h}   image")
+            return
+        fps_txt = f"{float(self.project.fps or 24.0):.3f}".rstrip("0").rstrip(".")
+        kind = "   seq" if is_sequence_path(self.project.path) else ""
+        star = "*" if self.project.fps_override else ""
+        self.lbl_meta.setText(f"{w}×{h}   {fps_txt}{star} fps{kind}")
+
+    def _apply_fps(self, fps: float | None, remember: bool = True) -> None:
+        """Sets (or clears with None) the frame-rate override for the current clip."""
+        native = float(getattr(self.project, "native_fps", self.project.fps) or 24.0)
+        if fps is not None and abs(float(fps) - native) < 1e-6 and not is_sequence_path(self.project.path):
+            fps = None
+        self.project.fps_override = float(fps) if fps else None
+        self.project.fps = float(fps) if fps else native
+        path = getattr(self.project, "path", "") or ""
+        if remember and path:
+            fo = dict(self._settings.get("fps_overrides", {}) or {})
+            if fps:
+                fo[self._notes_key(path)] = float(fps)
+            else:
+                fo.pop(self._notes_key(path), None)
+            self._settings["fps_overrides"] = fo
+            self._schedule_save()
+            self._autosave_timer.start(250)
+        # Audio is timed by the media's own rate: retimed playback runs silent
+        if path and not is_sequence_path(path) and not self._is_still and getattr(self, "_player", None) is not None:
+            try:
+                if self.project.fps_override:
+                    self._player.stop()
+                    self._player.setSource(QUrl())
+                elif self._player.source().isEmpty():
+                    self._load_clip_audio(path)
+            except Exception:
+                pass
+        if self.playing:
+            self.play_timer.start(max(8, int(1000 / max(self.project.fps, 1))))
+        self._update_meta_label()
+        self._update_time_label()
+
+    def _prompt_fps(self) -> None:
+        if not self._clip_open() or self._is_still:
+            return
+        native = float(getattr(self.project, "native_fps", self.project.fps) or 24.0)
+        nat_txt = f"{native:.3f}".rstrip("0").rstrip(".")
+        items = [f"Native ({nat_txt})", "12", "23.976", "24", "25", "29.97", "30", "48", "50", "60", "Custom…"]
+        cur = f"{float(self.project.fps):.3f}".rstrip("0").rstrip(".") if self.project.fps_override else items[0]
+        idx = items.index(cur) if cur in items else 0
+        choice, ok = QInputDialog.getItem(self, "Frame rate", "Playback / export frame rate:", items, idx, False)
+        if not ok:
+            return
+        if choice.startswith("Native"):
+            self._apply_fps(None)
+        elif choice.startswith("Custom"):
+            val, ok = QInputDialog.getDouble(self, "Frame rate", "Frames per second:", float(self.project.fps), 1.0, 240.0, 3)
+            if ok:
+                self._apply_fps(float(val))
+        else:
+            self._apply_fps(float(choice))
+        self.statusBar().showMessage(f"Frame rate: {self.project.fps:g} fps" + ("  (override — audio muted)" if self.project.fps_override and not is_sequence_path(self.project.path) else ""), 4000)
+
+    def open_sequence(self) -> None:
+        """Pick any frame of a numbered PNG/JPG/EXR/TIFF sequence."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open image sequence (pick any frame)", self._open_start_dir(),
+            "Image sequences (*.png *.jpg *.jpeg *.exr *.tif *.tiff *.bmp);;All files (*.*)"
+        )
+        if not path:
+            return
+        pat = sequence_pattern_for(path)
+        if not pat:
+            QMessageBox.information(self, "Image sequence", "No numbered sibling frames found — opening as a still image.")
+            self._set_queue([path])
+            return
+        self._set_queue([pat])
 
     def _notes_key(self, p: str) -> str:
         try:
@@ -6630,7 +7416,7 @@ class MainWindow(QMainWindow):
 
     def _set_queue(self, paths: list[str]) -> None:
         """Adds `paths` to the shot list (deduped); opens the first new one if nothing is open."""
-        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p)]
+        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p) or is_sequence_path(p)]
         if not fresh:
             return
         if self.queue_paths:
@@ -6652,7 +7438,7 @@ class MainWindow(QMainWindow):
 
     def _append_to_queue(self, paths: list[str]) -> None:
         """Adds files to the shot list (deduped) without opening/switching clips."""
-        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p)]
+        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p) or is_sequence_path(p)]
         if not fresh:
             return
         known = {str(Path(p).resolve()).lower() for p in self.queue_paths}
@@ -6666,7 +7452,7 @@ class MainWindow(QMainWindow):
 
     def _replace_queue(self, paths: list[str]) -> None:
         """Swaps the whole list (used by Open list) and opens the first entry."""
-        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p)]
+        fresh = [p for p in paths if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p) or is_sequence_path(p)]
         self.queue_paths = fresh
         self.queue_index = -1
         self._queue_refresh()
@@ -6740,7 +7526,12 @@ class MainWindow(QMainWindow):
         pm = QPixmap()
         ext = Path(path).suffix.lower()
         try:
-            if ext in (".mp4", ".mov") and cv2 is not None:
+            if is_sequence_path(path):
+                files, _first = sequence_files(path)
+                fr = read_image_bgr(files[len(files) // 10]) if files else None
+                if fr is not None:
+                    pm = QPixmap.fromImage(bgr_to_qimage(fr))
+            elif ext in (".mp4", ".mov") and cv2 is not None:
                 cap = cv2.VideoCapture(path)
                 n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(n * 0.1)))
@@ -6783,7 +7574,7 @@ class MainWindow(QMainWindow):
             return
         path = self.queue_paths[index]
         ext = Path(path).suffix.lower()
-        if ext in (".mp4", ".mov"):
+        if ext in (".mp4", ".mov") or is_sequence_path(path):
             ok = self._open_video_path(path)
         elif _is_image_path(path):
             ok = self._open_image_path(path)
@@ -6877,6 +7668,9 @@ class MainWindow(QMainWindow):
         self.btn_play.setEnabled(False)
         self.btn_play.setIcon(self._play_icon(False))
         self._update_time_label()
+        self._refresh_marks()
+        if getattr(self, "compare_path", None):
+            self.close_compare()
 
     def _queue_clear(self) -> None:
         self.queue_paths = []
@@ -7190,6 +7984,11 @@ class MainWindow(QMainWindow):
             "", max(proj.frame_count, 1), float(proj.fps or 24.0),
             int(proj.width or 1920), int(proj.height or 1080), keep_strokes=proj.strokes,
         )
+        self.project.start_frame = int(getattr(proj, "start_frame", 0) or 0)
+        self.project.text_notes = list(getattr(proj, "text_notes", []))
+        self._refresh_marks()
+        self._sync_start_box()
+        self._update_time_label()
         self.project.scene_path = scene_path
         self.project.user_saved = not is_autosave_name(scene_path)
         self._push_recent("recent_open", scene_path)
@@ -7242,7 +8041,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Save scene", "Open a video first.")
             return
         folder = self._save_start_dir() or str(Path.home() / "Documents")
-        name = (Path(self.project.path).stem if self.project.path else "board") + ".inkit"
+        name = (media_stem(self.project.path) if self.project.path else "board") + ".inkit"
         if (
             self.project.scene_path
             and Path(self.project.scene_path).is_file()
@@ -7283,7 +8082,12 @@ class MainWindow(QMainWindow):
             if not url.isLocalFile():
                 continue
             p = url.toLocalFile()
-            if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p):
+            if Path(p).is_dir():
+                seq = sequence_in_folder(p)
+                if seq:
+                    out.append(seq)
+                continue
+            if Path(p).suffix.lower() in (".mp4", ".mov", ".inkit", ".json") or _is_image_path(p) or is_sequence_path(p):
                 out.append(p)
         return out
 
@@ -7349,6 +8153,7 @@ class MainWindow(QMainWindow):
             self.slider.blockSignals(True)
             self.slider.setValue(index)
             self.slider.blockSignals(False)
+        self._update_compare_frame(index)
         self._update_time_label()
         if not self.playing and not getattr(self, "_maya_sync_guard", False):
             self._sync_audio()
@@ -7356,19 +8161,640 @@ class MainWindow(QMainWindow):
         self._push_app_frame(index)
 
 
+    # -----------------------------------------------------------------------
+    # A/B compare (frame-locked second clip, wipe or side by side)
+    # -----------------------------------------------------------------------
+
+    def _build_compare_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("compareBar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(10, 2, 10, 2)
+        lay.setSpacing(8)
+        self.lbl_compare = QLabel("B: —")
+        self.lbl_compare.setStyleSheet("color:#33d6ff; font-weight:bold;")
+        lay.addWidget(self.lbl_compare)
+        self._compare_btns: dict[str, QPushButton] = {}
+        for key, text, tip in (("off", "A only", "Show A only (keep B loaded)"),
+                               ("bonly", "B only", "Show B only, in A's frame (drawings stay visible)"),
+                               ("wipe", "Wipe", "Wipe: A left of the split, B right"),
+                               ("side", "Side by side", "A on the left, B on the right"),
+                               ("overlay", "Overlay", "B over A at adjustable opacity")):
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setToolTip(tip)
+            b.setStatusTip(tip)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, k=key: self._set_compare_mode(k))
+            lay.addWidget(b)
+            self._compare_btns[key] = b
+        self.sl_wipe = BoxSlider("Wipe", 0, 100, 50)
+        self.sl_wipe.setToolTip("Wipe position — click or drag")
+        self.sl_wipe.valueChanged.connect(self._set_compare_wipe)
+        lay.addWidget(self.sl_wipe)
+        self.sl_b_op = BoxSlider("B opacity", 0, 100, int(self._settings.get("compare_opacity", 50)))
+        self.sl_b_op.setToolTip("B opacity over A — drag left/right or click to type")
+        self.sl_b_op.valueChanged.connect(self._set_compare_opacity)
+        self.canvas.compare_opacity = self.sl_b_op.value() / 100.0
+        lay.addWidget(self.sl_b_op)
+        self.box_compare_start = FrameNumberBox("B start", 0)
+        self.box_compare_start.setToolTip("First frame number of clip B — B is locked to A by frame number (click to type, drag to scrub)")
+        self.box_compare_start.valueChanged.connect(self._set_compare_start)
+        lay.addWidget(self.box_compare_start)
+        btn_swap = QPushButton("Load B…")
+        btn_swap.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_swap.clicked.connect(self.load_compare_clip)
+        lay.addWidget(btn_swap)
+        btn_close = QPushButton("✕")
+        btn_close.setToolTip("Close compare")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(self.close_compare)
+        lay.addWidget(btn_close)
+        lay.addStretch(1)
+
+        def restyle() -> None:
+            c = self._colors()
+            bar.setStyleSheet(
+                f"#compareBar {{ background: {c['panel']}; }}"
+                f"#compareBar QPushButton {{ background: {c['card']}; border: 1px solid {c['border']};"
+                f" color: {c['text']}; padding: 4px 10px; border-radius: 4px; }}"
+                f"#compareBar QPushButton:checked {{ background: {c['accent']}; border-color: {c['accent']}; color: white; }}"
+                f"#compareBar QPushButton:hover {{ background: {c['card_hover']}; }}"
+            )
+
+        restyle()
+        self._dyn_styles.append(restyle)
+        bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        bar.setVisible(False)
+        self._compare_bar = bar
+        self.compare_reader = VideoReader()
+        self.compare_path: str | None = None
+        self.compare_start = 0
+        return bar
+
+    def load_compare_clip(self, path: str | None = None) -> bool:
+        """Loads clip B (video, sequence pattern or a frame of a sequence)."""
+        if not self._clip_open() or self._is_still or getattr(self.canvas, "is_board", False):
+            QMessageBox.information(self, "Compare A/B", "Open a video or image sequence (A) first.")
+            return False
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Load clip B to compare", self._open_start_dir(),
+                "Clips / sequences (*.mp4 *.mov *.MP4 *.MOV *.png *.jpg *.jpeg *.exr *.tif *.tiff);;All files (*.*)"
+            )
+            if not path:
+                return False
+        if not is_sequence_path(path) and Path(path).suffix.lower() in SEQUENCE_EXTS:
+            path = sequence_pattern_for(path) or path
+        try:
+            if _is_image_path(path):
+                raise RuntimeError("Pick a video or an image sequence frame for B.")
+            self.compare_reader.open(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Compare A/B", str(e))
+            return False
+        self.compare_path = path
+        b_start = self.compare_reader.seq_start
+        if b_start is None:
+            b_start = detect_start_frame(path)
+        # Unnumbered B: lock frame-for-frame to A (same start number)
+        self.compare_start = int(b_start) if b_start is not None else int(self.project.start_frame)
+        self.box_compare_start.setValue(self.compare_start, emit=False)
+        self.lbl_compare.setText(f"B: {Path(path).name}")
+        self.canvas.compare_labels = (f"A  {media_stem(self.project.path)}", f"B  {media_stem(path)}")
+        self._compare_bar.setVisible(True)
+        if self.canvas.compare_mode == "off":
+            self._set_compare_mode(self._settings.get("compare_mode", "wipe") if self._settings.get("compare_mode") in ("wipe", "side", "bonly", "overlay") else "wipe")
+        else:
+            self._set_compare_mode(self.canvas.compare_mode)
+        return True
+
+    def close_compare(self) -> None:
+        self.compare_reader.close()
+        self.compare_path = None
+        self.canvas.compare_image = None
+        self.canvas.compare_mode = "off"
+        if hasattr(self, "_compare_bar"):
+            self._compare_bar.setVisible(False)
+        self.canvas._cache_key = None
+        self.canvas.update()
+
+    def _set_compare_opacity(self, v: int) -> None:
+        self.canvas.compare_opacity = max(0, min(100, int(v))) / 100.0
+        self._settings["compare_opacity"] = int(v)
+        self._schedule_save()
+        self.canvas.update()
+
+    def _set_compare_mode(self, mode: str) -> None:
+        if mode not in ("off", "bonly", "wipe", "side", "overlay"):
+            mode = "off"
+        self.canvas.compare_mode = mode
+        if mode != "off":
+            self._settings["compare_mode"] = mode
+        for k, b in self._compare_btns.items():
+            b.setChecked(k == mode)
+        self.sl_wipe.setVisible(mode == "wipe")
+        self.sl_b_op.setVisible(mode == "overlay")
+        self.canvas._cache_key = None  # layout changed: rebuild stroke cache
+        self._update_compare_frame(self.canvas.current_frame)
+        self.canvas.update()
+
+    def _cycle_compare_mode(self) -> None:
+        if not self.compare_path:
+            self.load_compare_clip()
+            return
+        order = ["wipe", "side", "overlay", "bonly", "off"]
+        cur = self.canvas.compare_mode if self.canvas.compare_mode in order else "off"
+        self._set_compare_mode(order[(order.index(cur) + 1) % len(order)])
+
+    def _set_compare_wipe(self, v: int) -> None:
+        self.canvas.compare_wipe = max(0, min(100, int(v))) / 100.0
+        self.canvas.update()
+
+    def _set_compare_start(self, v: int) -> None:
+        self.compare_start = int(v)
+        self._update_compare_frame(self.canvas.current_frame)
+        self.canvas.update()
+
+    def compare_index_for(self, a_index: int) -> int:
+        """B frame index shown with A frame `a_index` (locked by frame NUMBER)."""
+        b = self.project.display_frame(a_index) - int(self.compare_start)
+        return max(0, min(b, max(self.compare_reader.count - 1, 0)))
+
+    def _update_compare_frame(self, a_index: int) -> None:
+        if not self.compare_path or self.compare_reader.cap is None or self.canvas.compare_mode == "off":
+            return
+        bgr = self.compare_reader.frame(self.compare_index_for(a_index))
+        self.canvas.compare_image = bgr_to_qimage(bgr) if bgr is not None else None
+
+    # -----------------------------------------------------------------------
+    # Typed review notes (per frame / range) + sidebar + review sheet
+    # -----------------------------------------------------------------------
+
+    def _build_notes_dock(self) -> None:
+        dock = QDockWidget("Review Notes", self)
+        dock.setObjectName("review_notes_dock")
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        btn_style = (
+            "QPushButton { background:#2b2b2b; color:#ddd; border:1px solid #4a4a4a; border-radius:6px; padding:4px 8px; }"
+            "QPushButton:hover { background:#3c3c3c; } QPushButton:pressed { background:#5285a6; color:white; }"
+        )
+        for text, tip, slot in (
+            ("+ Note", "Add a note on this frame or a range [N]", lambda: self.add_text_note()),
+            ("Sheet…", "Export review sheet (CSV + HTML with thumbnails)", lambda: self.export_review_sheet()),
+        ):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setStatusTip(tip)
+            b.setStyleSheet(btn_style)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        lay.addLayout(row)
+        self.notes_list = QListWidget()
+        self.notes_list.setWordWrap(True)
+        self.notes_list.setStyleSheet(
+            "QListWidget { background:#1e1e22; color:#e6e6ea; border:1px solid #3a3a42; border-radius:6px; }"
+            "QListWidget::item { padding:6px 4px; border-bottom:1px solid #2c2c33; }"
+            "QListWidget::item:selected { background:#2f4a5c; color:white; }"
+        )
+        self.notes_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.notes_list.customContextMenuRequested.connect(self._notes_context_menu)
+        self.notes_list.itemClicked.connect(self._notes_jump)
+        self.notes_list.itemActivated.connect(self._notes_jump)
+        self.notes_list.itemDoubleClicked.connect(lambda it: self._edit_text_note(it.data(Qt.ItemDataRole.UserRole)))
+        self.notes_list.installEventFilter(self)
+        lay.addWidget(self.notes_list, 1)
+        hint = QLabel("Click = jump · Double-click = edit · Del = remove")
+        hint.setStyleSheet("color:#777; font-size:10px;")
+        lay.addWidget(hint)
+        dock.setWidget(body)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self.notes_dock = dock
+        visible = bool(self._settings.get("notes_panel", False))
+        dock.setVisible(visible)
+        self.act_notes_panel.setChecked(visible)
+        dock.visibilityChanged.connect(self._notes_dock_visibility)
+        self._rebuild_notes_list()
+
+    def _notes_dock_visibility(self, vis: bool) -> None:
+        if self.isVisible() or vis:
+            self._settings["notes_panel"] = bool(vis)
+        if hasattr(self, "act_notes_panel"):
+            self.act_notes_panel.blockSignals(True)
+            self.act_notes_panel.setChecked(bool(vis))
+            self.act_notes_panel.blockSignals(False)
+
+    def _toggle_notes_dock(self, show: bool | None = None) -> None:
+        if not hasattr(self, "notes_dock"):
+            return
+        show = (not self.notes_dock.isVisible()) if show is None else bool(show)
+        self.notes_dock.setVisible(show)
+        self._settings["notes_panel"] = show
+        self._schedule_save()
+
+    def _note_label(self, n: dict) -> str:
+        a = self.project.display_frame(n["start"])
+        b = self.project.display_frame(n["end"])
+        rng = f"{a}" if a == b else f"{a}–{b}"
+        return f"{rng}    {n.get('text', '')}"
+
+    def _rebuild_notes_list(self) -> None:
+        if not hasattr(self, "notes_list"):
+            return
+        self.notes_list.blockSignals(True)
+        self.notes_list.clear()
+        cur = int(self.canvas.current_frame)
+        for i, n in enumerate(self.project.text_notes):
+            it = QListWidgetItem(self._note_label(n))
+            it.setData(Qt.ItemDataRole.UserRole, i)
+            if n["start"] <= cur <= n["end"]:
+                f = it.font()
+                f.setBold(True)
+                it.setFont(f)
+            self.notes_list.addItem(it)
+        self.notes_list.blockSignals(False)
+
+    def _notes_jump(self, item) -> None:
+        i = item.data(Qt.ItemDataRole.UserRole)
+        if i is None or not (0 <= int(i) < len(self.project.text_notes)):
+            return
+        self._show_frame(int(self.project.text_notes[int(i)]["start"]))
+
+    def _notes_context_menu(self, pos) -> None:
+        it = self.notes_list.itemAt(pos)
+        menu = QMenu(self)
+        if it is not None:
+            i = int(it.data(Qt.ItemDataRole.UserRole))
+            menu.addAction("Edit note…", lambda: self._edit_text_note(i))
+            menu.addAction("Delete note", lambda: self._delete_text_note(i))
+            menu.addSeparator()
+        menu.addAction("Add note on current frame…", lambda: self.add_text_note())
+        menu.addAction("Export review sheet…", self.export_review_sheet)
+        menu.exec(self.notes_list.mapToGlobal(pos))
+
+    def _notes_changed(self) -> None:
+        self.project.text_notes.sort(key=lambda n: (n["start"], n["end"]))
+        self._refresh_marks()
+        self.canvas.update()
+        self._autosave_timer.start(250)
+
+    def add_text_note(self) -> None:
+        """Adds a typed note; From/To default to the current frame (edit for a range)."""
+        if not self._clip_open():
+            self.statusBar().showMessage("Open a clip first")
+            return
+        start = int(self.project.start_frame)
+        last = start + max(self.project.frame_count - 1, 0)
+        cur = self.project.display_frame(self.canvas.current_frame)
+        dlg = NoteDialog(self, start, last, cur, cur, "", "Add note")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        a, b, text = dlg.result_values()
+        if not text:
+            return
+        self.project.text_notes.append({"start": a - start, "end": b - start, "text": text})
+        self._notes_changed()
+        if hasattr(self, "notes_dock") and not self.notes_dock.isVisible():
+            self._toggle_notes_dock(True)
+
+    def _edit_text_note(self, i) -> None:
+        if i is None or not (0 <= int(i) < len(self.project.text_notes)):
+            return
+        n = self.project.text_notes[int(i)]
+        start = int(self.project.start_frame)
+        last = start + max(self.project.frame_count - 1, 0)
+        dlg = NoteDialog(self, start, last, n["start"] + start, n["end"] + start, n.get("text", ""), "Edit note")
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        a, b, text = dlg.result_values()
+        if not text:
+            self._delete_text_note(int(i))
+            return
+        n.update({"start": a - start, "end": b - start, "text": text})
+        self._notes_changed()
+
+    def _delete_text_note(self, i: int) -> None:
+        if 0 <= int(i) < len(self.project.text_notes):
+            del self.project.text_notes[int(i)]
+            self._notes_changed()
+
+    # -- shared frame renderer for review-sheet / frame exports -------------
+    def _open_export_reader(self):
+        """A private reader on the current media (never disturbs the viewport)."""
+        if getattr(self.canvas, "is_board", False) or self._is_still:
+            return None
+        r = VideoReader()
+        try:
+            r.open(self.project.path)
+        except Exception:
+            return None
+        return r
+
+    def _render_export_frame(self, index: int, reader=None) -> np.ndarray:
+        """BGR frame `index` with clip opacity, drawings and overlay burned in."""
+        if getattr(self.canvas, "is_board", False):
+            c = QColor(self.canvas.board_bg)
+            base = np.zeros((int(self.project.height or 1080), int(self.project.width or 1920), 3), np.uint8)
+            base[:] = (c.blue(), c.green(), c.red())
+        elif self._is_still and self._still_bgr is not None:
+            base = self._still_bgr.copy()
+        else:
+            bgr = reader.frame(index) if reader is not None else None
+            base = bgr.copy() if bgr is not None else np.zeros((int(self.project.height or 1080), int(self.project.width or 1920), 3), np.uint8)
+        clip_op = float(getattr(self.canvas, "clip_opacity", 1.0))
+        if clip_op < 0.995 and not getattr(self.canvas, "is_board", False):
+            fc = getattr(self.canvas, "fade_color", QColor("#ffffff"))
+            c = QColor(fc.name(QColor.NameFormat.HexRgb) if hasattr(fc, "name") else str(fc))
+            fade = np.array([c.blue(), c.green(), c.red()], dtype=np.float32)
+            base = (base.astype(np.float32) * clip_op + fade * (1.0 - clip_op)).astype(np.uint8)
+        nop = float(getattr(self.canvas, "notes_opacity", 1.0))
+        aa = bool(self.canvas.antialias)
+        strokes = self.project.strokes.get(index, [])
+        if strokes:
+            base = render_annotations_on_bgr(base, strokes, antialias=aa, notes_opacity=nop)
+        if self.project.overlay_strokes:
+            base = render_annotations_on_bgr(base, self.project.overlay_strokes, antialias=aa, notes_opacity=nop)
+        return base
+
+    def _review_rows(self) -> list[dict]:
+        """One row per typed note, plus one per drawn frame without a typed note."""
+        rows: list[dict] = []
+        covered: set[int] = set()
+        for n in self.project.text_notes:
+            rows.append({"start": n["start"], "end": n["end"], "text": n.get("text", "")})
+            covered.update(range(n["start"], n["end"] + 1))
+        for f in self.project.annotated_frames():
+            if f not in covered:
+                rows.append({"start": f, "end": f, "text": ""})
+        rows.sort(key=lambda r: (r["start"], r["end"]))
+        return rows
+
+    def export_annotated_frames(self, folder: str | None = None) -> list[str]:
+        """Writes every drawn / noted frame as <stem>.<frame>.png (display frame
+        numbers, drawings burned in) plus <stem>_contact_sheet.png."""
+        if not self._clip_open():
+            QMessageBox.information(self, "Export frames", "Open a clip first.")
+            return []
+        self.canvas._end()
+        frames = sorted(set(self.project.annotated_frames()) | {int(n["start"]) for n in self.project.text_notes})
+        if not frames:
+            QMessageBox.information(self, "Export frames", "No drawn or noted frames to export yet.")
+            return []
+        if folder is None:
+            start_dir = self._settings.get("last_export_dir") or self._save_start_dir() or str(Path.home())
+            folder = QFileDialog.getExistingDirectory(self, "Export annotated frames to folder", start_dir)
+            if not folder:
+                return []
+        out_dir = Path(folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = media_stem(self.project.path)
+        pad = max(4, len(str(self.project.display_frame(max(self.project.frame_count - 1, 0)))))
+        reader = self._open_export_reader()
+        prog = QProgressDialog("Exporting annotated frames…", "Cancel", 0, len(frames) + 1, self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(300)
+        written: list[str] = []
+        tiles: list[tuple[np.ndarray, str]] = []
+        try:
+            for k, f in enumerate(frames):
+                if prog.wasCanceled():
+                    break
+                prog.setValue(k)
+                img = self._render_export_frame(f, reader)
+                num = self.project.display_frame(f)
+                dest = out_dir / f"{stem}.{num:0{pad}d}.png"
+                if cv2.imwrite(str(dest), img):
+                    written.append(str(dest))
+                label = str(num)
+                txt = " / ".join(n.get("text", "").strip() for n in self.project.notes_at(f) if n.get("text", "").strip())
+                tiles.append((img, f"{label}   {txt}" if txt else label))
+            if tiles:
+                sheet = self._contact_sheet(tiles, title=Path(self.project.path).name if self.project.path else "Drawing board")
+                cs = out_dir / f"{stem}_contact_sheet.png"
+                if sheet.save(str(cs), "PNG"):
+                    written.append(str(cs))
+        finally:
+            if reader is not None:
+                reader.close()
+            prog.close()
+        self._settings["last_export_dir"] = str(out_dir)
+        self._schedule_save()
+        self.statusBar().showMessage(f"Exported {len(written)} files to {out_dir}", 5000)
+        return written
+
+    def _contact_sheet(self, tiles: list[tuple[np.ndarray, str]], title: str = "", cols: int = 4, tile_w: int = 480) -> QImage:
+        """Grid of annotated thumbnails with frame numbers / notes underneath."""
+        h0, w0 = tiles[0][0].shape[:2]
+        tile_h = max(1, int(round(h0 * tile_w / max(w0, 1))))
+        cols = max(1, min(cols, len(tiles)))
+        rows = (len(tiles) + cols - 1) // cols
+        gap, cap_h, head_h = 16, 44, 56
+        W = cols * tile_w + (cols + 1) * gap
+        H = head_h + rows * (tile_h + cap_h + gap) + gap
+        sheet = QImage(W, H, QImage.Format.Format_RGB32)
+        sheet.fill(QColor("#1a1a1c"))
+        p = QPainter(sheet)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        f = QFont()
+        f.setPixelSize(22)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor("#f2f3f7"))
+        p.drawText(QRectF(gap, 0, W - 2 * gap, head_h), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                   f"{title}   ·   {len(tiles)} frames   ·   {time.strftime('%Y-%m-%d')}")
+        f.setPixelSize(15)
+        f.setBold(False)
+        p.setFont(f)
+        for i, (img, label) in enumerate(tiles):
+            r, c = divmod(i, cols)
+            x = gap + c * (tile_w + gap)
+            y = head_h + r * (tile_h + cap_h + gap)
+            thumb = cv2.resize(img, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+            p.drawImage(QRectF(x, y, tile_w, tile_h), bgr_to_qimage(thumb))
+            p.setPen(QColor("#33d6ff"))
+            p.drawText(QRectF(x, y + tile_h + 4, tile_w, cap_h - 4),
+                       int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap), label)
+        p.end()
+        return sheet
+
+    def export_review_sheet(self, dest: str | None = None) -> str | None:
+        """Writes <name>.csv and <name>.html (thumbnails embedded) for all notes."""
+        if not self._clip_open():
+            QMessageBox.information(self, "Review sheet", "Open a clip first.")
+            return None
+        self.canvas._end()
+        rows = self._review_rows()
+        if not rows:
+            QMessageBox.information(self, "Review sheet", "No notes or drawings to export yet.")
+            return None
+        stem = media_stem(self.project.path) if self.project.path else "board"
+        if dest is None:
+            export_dir = self._settings.get("last_export_dir") or self._save_start_dir()
+            default = str(Path(export_dir or Path.home()) / f"{stem}_review.html")
+            dest, _ = QFileDialog.getSaveFileName(self, "Export review sheet", default, "HTML review sheet (*.html)")
+            if not dest:
+                return None
+        if not dest.lower().endswith((".html", ".htm")):
+            dest += ".html"
+        html_path = Path(dest)
+        csv_path = html_path.with_suffix(".csv")
+        fps = float(self.project.fps or 24.0)
+        reader = self._open_export_reader()
+        prog = QProgressDialog("Building review sheet…", "Cancel", 0, len(rows), self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(300)
+        cards: list[str] = []
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as fh:
+                wr = csv.writer(fh)
+                wr.writerow(["shot", "frame_start", "frame_end", "timecode", "note", "has_drawing"])
+                for k, r in enumerate(rows):
+                    if prog.wasCanceled():
+                        return None
+                    prog.setValue(k)
+                    a, b = int(r["start"]), int(r["end"])
+                    drawn = any(self.project.strokes.get(f) for f in range(a, b + 1))
+                    da, db = self.project.display_frame(a), self.project.display_frame(b)
+                    tc = format_time(a, fps)
+                    wr.writerow([stem, da, db, tc, r["text"], "yes" if drawn else "no"])
+                    img = self._render_export_frame(a, reader)
+                    h, w = img.shape[:2]
+                    tw = 480
+                    th = max(1, int(round(h * tw / max(w, 1))))
+                    thumb = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+                    ok, buf = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    src = "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode() if ok else ""
+                    rng = f"{da}" if da == db else f"{da}–{db}"
+                    cards.append(
+                        f'<div class="card"><img src="{src}"><div class="meta"><b>{rng}</b>'
+                        f'<span>{html.escape(tc)}</span>{"<i>drawing</i>" if drawn else ""}</div>'
+                        f'<p>{html.escape(r["text"]).replace(chr(10), "<br>") or "<em>(drawing only)</em>"}</p></div>'
+                    )
+        finally:
+            if reader is not None:
+                reader.close()
+            prog.close()
+        title = html.escape(Path(self.project.path).name if self.project.path else "Drawing board")
+        page = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            f"<title>{title} — InkIt review</title><style>"
+            "body{background:#1a1a1c;color:#e6e6ea;font-family:Segoe UI,Arial,sans-serif;margin:24px}"
+            "h1{font-size:20px;margin:0 0 4px} .sub{color:#8a8a95;margin-bottom:18px}"
+            ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}"
+            ".card{background:#24242a;border:1px solid #33343c;border-radius:8px;overflow:hidden}"
+            ".card img{width:100%;display:block;background:#000}"
+            ".meta{display:flex;gap:12px;align-items:center;padding:8px 12px 0;color:#8a8a95}"
+            ".meta b{color:#33d6ff;font-size:15px} .meta i{color:#ffcc00;font-style:normal}"
+            "p{margin:6px 12px 12px;line-height:1.4} em{color:#777}"
+            "@media print{body{background:#fff;color:#000}.card{break-inside:avoid;background:#fff}}"
+            "</style></head><body>"
+            f"<h1>{title}</h1><div class='sub'>{len(rows)} notes · {fps:g} fps · frames "
+            f"{self.project.display_frame(0)}–{self.project.display_frame(max(self.project.frame_count - 1, 0))}"
+            f" · exported {time.strftime('%Y-%m-%d %H:%M')}</div>"
+            f"<div class='grid'>{''.join(cards)}</div></body></html>"
+        )
+        html_path.write_text(page, encoding="utf-8")
+        self._settings["last_export_dir"] = str(html_path.parent)
+        self._schedule_save()
+        self.statusBar().showMessage(f"Review sheet saved: {html_path.name} + {csv_path.name}", 5000)
+        return str(html_path)
+
+    # -----------------------------------------------------------------------
+    # Start frame number (display offset)
+    # -----------------------------------------------------------------------
+
+    def _initial_start_frame(self, path: str | None) -> int:
+        """Remembered start frame for this media, else auto-detected, else 0."""
+        if not path:
+            return 0
+        saved = (self._settings.get("start_frames", {}) or {}).get(self._notes_key(path))
+        if saved is not None:
+            return int(saved)
+        seq_start = getattr(self.reader, "seq_start", None) if self.reader.path == path else None
+        if seq_start is not None:
+            return int(seq_start)
+        det = detect_start_frame(path)
+        if det is not None:
+            return int(det)
+        return self._last_start_frame()
+
+    @staticmethod
+    def _qsettings() -> QSettings:
+        return QSettings("InkIt", "InkIt")
+
+    def _last_start_frame(self) -> int:
+        """Last start frame the user set anywhere (QSettings), default 0."""
+        try:
+            return int(self._qsettings().value("start_frame/last", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _sync_start_box(self) -> None:
+        if hasattr(self, "box_start"):
+            self.box_start.setValue(int(self.project.start_frame), emit=False)
+
+    def _set_start_frame(self, value: int) -> None:
+        """User changed the start frame: re-label everything, remember per clip."""
+        value = int(value)
+        if value == int(self.project.start_frame):
+            return
+        self.project.start_frame = value
+        qs = self._qsettings()
+        qs.setValue("start_frame/last", value)
+        qs.sync()
+        path = getattr(self.project, "path", "") or ""
+        if path:
+            sf = dict(self._settings.get("start_frames", {}) or {})
+            sf[self._notes_key(path)] = value
+            self._settings["start_frames"] = sf
+            if str(path) not in self._maya_offsets and value != 0:
+                self._maya_offset = 0
+        self._sync_start_box()
+        self._update_time_label()
+        self._refresh_marks()
+        self._schedule_save()
+        self._autosave_timer.start(250)
+        self._maybe_send_to_maya(self.canvas.current_frame)
+        self._push_app_frame(self.canvas.current_frame)
+        self.statusBar().showMessage(f"Start frame: {value}", 2500)
+
+    def _prompt_goto_frame(self) -> None:
+        """Type a frame NUMBER (honouring the start frame) to jump to."""
+        if self.project.frame_count <= 0:
+            return
+        start = int(self.project.start_frame)
+        cur = self.project.display_frame(self.canvas.current_frame)
+        val, ok = QInputDialog.getInt(
+            self, "Go to frame", "Frame number:", cur, start, start + self.project.frame_count - 1, 1
+        )
+        if ok:
+            self._show_frame(int(val) - start)
+
     def _update_time_label(self) -> None:
+        start = int(getattr(self.project, "start_frame", 0) or 0)
         f = self.canvas.current_frame
         n = max(self.project.frame_count - 1, 0)
         fps = self.project.fps or 24.0
         if self.time_mode == "frames":
-            self.lbl_time.setText(f"Frame {f} / {n}")
-            self.canvas.frame_overlay_text = f"{f}"
+            self.lbl_time.setText(f"Frame {f + start} / {n + start}")
+            self.canvas.frame_overlay_text = f"{f + start}"
         else:
             t = format_time(f, fps)
             self.lbl_time.setText(f"{t}  /  {format_time(n, fps)}")
             self.canvas.frame_overlay_text = t
         if getattr(self.canvas, "frame_overlay", False):
             self.canvas.update()
+        if hasattr(self, "notes_dock") and self.notes_dock.isVisible() and getattr(self, "_notes_bold_frame", None) != f:
+            self._notes_bold_frame = f
+            self._rebuild_notes_list()
         self._update_maya_status_indicator()
 
     def _toggle_time_mode(self) -> None:
@@ -7952,7 +9378,7 @@ Start-Sleep -Milliseconds 80
         self._maya_server = srv
         self._update_maya_status_indicator()
         if not silent:
-            self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset}  Maya {self._maya_offset}=InkIt 0)", 4000)
+            self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset}  Maya {self._maya_offset + int(self.project.start_frame)}=InkIt {int(self.project.start_frame)})", 4000)
 
     def _stop_maya_server(self) -> None:
         if self._maya_server is not None:
@@ -8095,7 +9521,7 @@ Start-Sleep -Milliseconds 80
             return
         if self.project.frame_count <= 0:
             return
-        inkit = int(maya_frame) - int(self._maya_offset)
+        inkit = int(maya_frame) - int(self._maya_offset) - int(self.project.start_frame)
         inkit = max(0, min(inkit, int(self.project.frame_count) - 1))
         # coalesce — Maya may send 60fps during drag/play, process at display rate
         self._maya_pending_frame = inkit
@@ -8144,15 +9570,19 @@ Start-Sleep -Milliseconds 80
         if save:
             self._schedule_save()
         self._update_maya_status_indicator()
-        self.statusBar().showMessage(f"Maya offset: Maya {offset} = InkIt 0  (Maya {offset}+{self.canvas.current_frame}=InkIt {self.canvas.current_frame})", 4000)
+        cur = self.project.display_frame(self.canvas.current_frame)
+        self.statusBar().showMessage(f"Maya offset: {offset}  (InkIt {cur} = Maya {cur + int(offset)})", 4000)
 
     def _prompt_maya_offset(self) -> None:
         cur = int(self._maya_offset)
         # suggest current Maya frame as zero mapping
-        hint = f"Which Maya frame should equal InkIt 0?\nCurrent: Maya {cur} = InkIt 0  (InkIt {self.canvas.current_frame} is Maya {cur + int(self.canvas.current_frame)})"
-        val, ok = QInputDialog.getInt(self, "Maya Start Frame", hint, cur, -1000000, 1000000, 1)
+        start = int(self.project.start_frame)
+        disp = self.project.display_frame(self.canvas.current_frame)
+        hint = (f"Which Maya frame should equal InkIt frame {start} (the clip's first frame)?\n"
+                f"Current: Maya {cur + start} = InkIt {start}  (InkIt {disp} is Maya {cur + disp})")
+        val, ok = QInputDialog.getInt(self, "Maya Start Frame", hint, cur + start, -1000000, 10000000, 1)
         if ok:
-            self._set_maya_offset(int(val), save=True)
+            self._set_maya_offset(int(val) - start, save=True)
             if self._maya_server is not None:
                 self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset})", 3000)
 
@@ -8162,6 +9592,9 @@ Start-Sleep -Milliseconds 80
         off = self._maya_offsets.get(str(path))
         if off is not None:
             self._maya_offset = int(off)
+        elif int(getattr(self.project, "start_frame", 0) or 0) != 0:
+            # Clip carries real frame numbers (e.g. 1001): Maya frame == InkIt frame
+            self._maya_offset = 0
 
     def _maybe_send_to_maya(self, inkit_frame: int) -> None:
         if not bool(self._settings.get("maya_sync", False)):
@@ -8172,7 +9605,7 @@ Start-Sleep -Milliseconds 80
             return
         try:
             import socket
-            maya_frame = int(inkit_frame) + int(self._maya_offset)
+            maya_frame = int(inkit_frame) + int(self.project.start_frame) + int(self._maya_offset)
             s = socket.socket()
             s.settimeout(0.015)
             s.connect(("127.0.0.1", int(self._maya_send_port)))
@@ -8192,7 +9625,7 @@ Start-Sleep -Milliseconds 80
             s = socket.socket()
             s.settimeout(0.015)
             s.connect(("127.0.0.1", int(self._maya_send_port)))
-            s.sendall(f"APPFRAME {int(inkit_frame)}\n".encode())
+            s.sendall(f"APPFRAME {int(inkit_frame) + int(self.project.start_frame)}\n".encode())
             s.close()
         except Exception:
             self._maya_send_fail_until = time.time() + 1.0
@@ -8337,7 +9770,7 @@ Start-Sleep -Milliseconds 80
             QMessageBox.critical(self, "Export", "FFmpeg was not found. Install FFmpeg and try again.")
             return
         export_dir = self._settings.get("last_export_dir") or self._save_start_dir()
-        default = str(Path(export_dir or Path(self.project.path).parent) / (Path(self.project.path).stem + "_notes.mp4"))
+        default = str(Path(export_dir or Path(self.project.path).parent) / (media_stem(self.project.path) + "_notes.mp4"))
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export video with notes",
@@ -8371,7 +9804,7 @@ Start-Sleep -Milliseconds 80
     def _export_still_image(self) -> None:
         """Exports the annotated image (strokes baked in) as PNG/JPG."""
         export_dir = self._settings.get("last_export_dir") or self._save_start_dir()
-        default = str(Path(export_dir or Path(self.project.path).parent) / (Path(self.project.path).stem + "_notes.png"))
+        default = str(Path(export_dir or Path(self.project.path).parent) / (media_stem(self.project.path) + "_notes.png"))
         path, _ = QFileDialog.getSaveFileName(
             self, "Export image with notes", default,
             "PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp)"
@@ -8591,7 +10024,7 @@ Start-Sleep -Milliseconds 80
                 menu.addAction(act)
 
     def _open_recent_open(self, path: str) -> None:
-        if not Path(path).is_file():
+        if not media_exists(path):
             QMessageBox.warning(self, "Recent", f"File not found:\n{path}")
             items = [p for p in self._settings.get("recent_open", []) if p != path]
             self._settings["recent_open"] = items
@@ -8630,7 +10063,7 @@ Start-Sleep -Milliseconds 80
             if self._bind_board_data(proj, path):
                 self._settings["last_open_dir"] = str(Path(path).parent)
             return
-        if not video or not Path(video).is_file():
+        if not video or not media_exists(video):
             QMessageBox.warning(self, "Open scene", "Scene loaded, but the clip was not found. Choose the media file.")
             video, _ = QFileDialog.getOpenFileName(
                 self, "Locate clip for this scene", self._open_start_dir(),
@@ -8644,6 +10077,15 @@ Start-Sleep -Milliseconds 80
         else:
             ok = self._open_video_path(proj.path, strokes=proj.strokes)
         if ok:
+            self.project.text_notes = list(proj.text_notes)
+            if proj.fps_override:
+                self._apply_fps(float(proj.fps_override), remember=False)
+            self._refresh_marks()
+            if "start_frame" in data:
+                self.project.start_frame = int(data.get("start_frame") or 0)
+                self._sync_start_box()
+                self._load_maya_offset_for_path(self.project.path)
+                self._update_time_label()
             self.project.scene_path = path
             self.project.user_saved = not is_autosave_name(path)
             self._settings["last_open_dir"] = str(Path(path).parent)
@@ -8681,6 +10123,11 @@ Start-Sleep -Milliseconds 80
         # leave. Floating tooltip windows are suppressed entirely (QEvent.ToolTip
         # is consumed), so ALL hover info lives in the status bar only.
         et = ev.type()
+        if obj is getattr(self, "notes_list", None) and et == QEvent.Type.KeyPress and ev.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            it = self.notes_list.currentItem()
+            if it is not None:
+                self._delete_text_note(int(it.data(Qt.ItemDataRole.UserRole)))
+            return True
         if et == QEvent.Type.ToolTip:
             return True  # no floating tooltips — hover info goes to the status bar
         # Eyedropper owns ALL mouse input while open: clicks sample the color
@@ -8864,7 +10311,7 @@ Start-Sleep -Milliseconds 80
         is_board = bool(getattr(self.canvas, "is_board", False)) and not self.project.path
         if not self.project.path and not is_board:
             return
-        if not self.project.annotated_frames() and not self.project.user_saved:
+        if not self.project.annotated_frames() and not self.project.text_notes and not self.project.user_saved:
             return
         if (
             self.project.user_saved
@@ -8874,7 +10321,7 @@ Start-Sleep -Milliseconds 80
         ):
             dest = Path(self.project.scene_path)
         else:
-            stem = Path(self.project.path).stem if self.project.path else "board"
+            stem = media_stem(self.project.path) if self.project.path else "board"
             dest = self.get_autosave_dir() / f"{stem}_autosave.inkit"
             if not self.project.user_saved:
                 self.project.scene_path = str(dest)

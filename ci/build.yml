@@ -1,0 +1,55 @@
+# Move this file to .github/workflows/build.yml to enable CI (needs a push with the GitHub "workflow" scope).
+name: Build InkIt.exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false  # the committed dist/InkIt.exe is not needed to build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile check
+        run: python -m py_compile app.py maya_inkit_sync.py inkit_bootstrap.py
+
+      - name: Headless smoke test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tests/smoke_test.py
+
+      - name: Build single exe
+        run: pyinstaller --clean --noconfirm InkIt.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InkIt-exe
+          path: dist/InkIt.exe
+          if-no-files-found: error
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/InkIt.exe
+          generate_release_notes: true
