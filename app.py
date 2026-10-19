@@ -17,7 +17,7 @@ ARCHITECTURE & COMPONENT MAP:
    - Project: Video metadata, frame count, FPS, per-frame stroke map, JSON I/O
 
 3. VIDEO DECODING & HELPERS
-   - VideoReader: OpenCV VideoCapture wrapper with single-frame caching
+   - VideoReader: frame-accurate OpenCV reader (timestamp-verified seeks + LRU frame cache)
    - bgr_to_qimage(): Fast color conversion from OpenCV BGR to Qt QImage
    - config_dir(): Roaming application data directory (%APPDATA%/InkIt)
    - DEFAULT_SHORTCUTS & ACTION_LABELS: Global keyboard shortcut maps
@@ -81,6 +81,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -351,14 +352,34 @@ class Project:
 
 class VideoReader:
     """
-    Fast, frame-accurate video frame reader using OpenCV VideoCapture.
-    Maintains a single-frame cache to prevent redundant seeks and decodes.
+    Frame-accurate video frame reader using OpenCV VideoCapture.
+
+    Seeking strategy (robust against long-GOP / B-frame H.264, MOV edit lists
+    and backends whose CAP_PROP_POS_FRAMES seeks land a few frames off):
+      * Sequential next frame / short forward hops are decoded forward.
+      * Random access seeks a little BEFORE the target (pre-roll), then decodes
+        forward, identifying every decoded frame by its presentation timestamp
+        (CAP_PROP_POS_MSEC) rather than trusting the seek. If the seek landed
+        past the target the pre-roll grows; as a last resort the file is
+        re-opened and decoded from frame 0.
+      * Every frame decoded on the way is kept in a small LRU cache, so
+        stepping backwards right after a seek is instant.
     """
+    PREROLL = 12            # frames decoded before a random-access target
+    FORWARD_DECODE = 48     # forward hops up to this many frames never seek
+    CACHE_BYTES = 384 * 1024 * 1024
+
     def __init__(self) -> None:
         self.cap: cv2.VideoCapture | None = None
         self.path: str | None = None
+        self.fps: float = 24.0
+        self.count: int = 0
         self._last_idx = -1
         self._last_bgr: np.ndarray | None = None
+        self._t0_ms = 0.0
+        self._ts_ok = True
+        self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self._cache_max = 64
 
     def open(self, path: str) -> tuple[int, float, int, int]:
         """Opens video file and returns (frame_count, fps, width, height)."""
@@ -372,31 +393,119 @@ class VideoReader:
         fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
         if fps <= 1e-3:
             fps = 24.0
+        self.fps = float(fps)
         count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        # Timestamp of frame 0 — later frames are identified relative to it
+        self._t0_ms = 0.0
+        self._ts_ok = True
+        ok, bgr = cap.read()
+        if ok and bgr is not None:
+            self._t0_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+            self._last_idx = 0
+            self._last_bgr = bgr
+            frame_bytes = max(1, int(bgr.nbytes))
+            self._cache_max = int(min(max(self.CACHE_BYTES // frame_bytes, 8), 240))
+            self._cache_put(0, bgr)
+            # Backends without usable timestamps report a constant POS_MSEC;
+            # fall back to sequential counting for those.
+            ok2, bgr2 = cap.read()
+            if ok2 and bgr2 is not None:
+                ms2 = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                self._ts_ok = ms2 > self._t0_ms
+                self._last_idx = 1
+                self._last_bgr = bgr2
+                self._cache_put(1, bgr2)
+            if not w or not h:
+                h, w = bgr.shape[:2]
+        self.count = count
         return count, fps, w, h
 
+    # -- cache ---------------------------------------------------------------
+    def _cache_put(self, idx: int, bgr: np.ndarray) -> None:
+        self._cache[idx] = bgr
+        self._cache.move_to_end(idx)
+        while len(self._cache) > self._cache_max:
+            self._cache.popitem(last=False)
+
+    def _cache_get(self, idx: int) -> np.ndarray | None:
+        bgr = self._cache.get(idx)
+        if bgr is not None:
+            self._cache.move_to_end(idx)
+        return bgr
+
+    # -- decoding ------------------------------------------------------------
+    def _decoded_index(self, fallback: int) -> int:
+        """Index of the frame just returned by read(), from its timestamp."""
+        if self._ts_ok:
+            ms = self.cap.get(cv2.CAP_PROP_POS_MSEC) if self.cap is not None else -1.0
+            if ms is not None and ms >= 0.0:
+                return int(round((float(ms) - self._t0_ms) * self.fps / 1000.0))
+        return fallback
+
+    def _read_next(self) -> tuple[int, np.ndarray | None]:
+        """Decodes one frame forward; returns (index, bgr) and caches it."""
+        ok, bgr = self.cap.read()
+        if not ok or bgr is None:
+            return -1, None
+        idx = self._decoded_index(self._last_idx + 1)
+        self._last_idx = idx
+        self._last_bgr = bgr
+        self._cache_put(idx, bgr)
+        return idx, bgr
+
+    def _decode_forward_to(self, index: int) -> np.ndarray | None:
+        """Decodes forward from the current position until `index` is reached."""
+        guard = 0
+        while guard < 100000:
+            guard += 1
+            idx, bgr = self._read_next()
+            if bgr is None:
+                return None
+            if idx == index:
+                return bgr
+            if idx > index:
+                return None  # overshoot — caller re-seeks earlier
+        return None
+
+    def _seek_decode(self, index: int) -> np.ndarray | None:
+        preroll = self.PREROLL
+        for _attempt in range(3):
+            start = max(0, index - preroll)
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            self._last_idx = start - 1
+            bgr = self._decode_forward_to(index)
+            if bgr is not None:
+                return bgr
+            if start == 0:
+                break
+            preroll *= 4
+        # Last resort: re-open and decode from the very first frame.
+        self.cap.release()
+        self.cap = cv2.VideoCapture(self.path)
+        self._last_idx = -1
+        if not self.cap.isOpened():
+            return None
+        return self._decode_forward_to(index)
+
     def frame(self, index: int) -> np.ndarray | None:
-        """Retrieves raw BGR frame by index (0-based) with seek optimization."""
+        """Retrieves raw BGR frame by index (0-based), frame-accurately."""
         if self.cap is None:
             return None
-        index = max(0, index)
-        # Return cached frame if requested again
-        if index == self._last_idx and self._last_bgr is not None:
+        index = max(0, int(index))
+        hit = self._cache_get(index)
+        if hit is not None:
+            return hit
+        if self._last_idx < index <= self._last_idx + self.FORWARD_DECODE:
+            bgr = self._decode_forward_to(index)
+        else:
+            bgr = None
+        if bgr is None:
+            bgr = self._seek_decode(index)
+        if bgr is None:
+            # Past the real end (container frame counts can over-report)
             return self._last_bgr
-        # Only seek if not strictly sequential next frame
-        if index != self._last_idx + 1:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-        ok, bgr = self.cap.read()
-        if not ok:
-            # Fallback seek attempt
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-            ok, bgr = self.cap.read()
-            if not ok:
-                return self._last_bgr
-        self._last_idx = index
-        self._last_bgr = bgr
         return bgr
 
     def close(self) -> None:
@@ -406,6 +515,7 @@ class VideoReader:
             self.cap = None
         self._last_idx = -1
         self._last_bgr = None
+        self._cache.clear()
 
 
 def bgr_to_qimage(bgr: np.ndarray) -> QImage:

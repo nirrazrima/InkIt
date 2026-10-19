@@ -21,6 +21,9 @@ import numpy as np  # noqa: E402
 import app  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _media import frame_id as block_id, make_h264  # noqa: E402
+
 
 def make_clip(path: Path, n: int = 48, fps: float = 24.0, size=(320, 180), gop: int = 0) -> None:
     """Writes a clip whose frame i carries its index in the red channel of pixel (0,0)
@@ -52,6 +55,46 @@ def check(cond: bool, msg: str) -> None:
     print("ok  ", msg)
 
 
+def test_frame_accurate_seek(w, tmp: Path, qapp) -> None:
+    """Random access, backward stepping and a backend whose seeks land late."""
+    import random
+    clip = tmp / "gop250.mp4"
+    make_h264(clip, n=300, gop=250, bframes=3)
+    r = app.VideoReader()
+    n, _fps, _w, _h = r.open(str(clip))
+    rnd = random.Random(7)
+    order = rnd.sample(range(n), 80) + list(range(120, 90, -1)) + [299, 0, 298]
+    bad = [i for i in order if block_id(r.frame(i)) != i]
+    check(not bad, f"VideoReader frame-accurate on long-GOP H.264 ({len(order)} seeks)")
+
+    class LateSeek:
+        """Wraps a capture so CAP_PROP_POS_FRAMES seeks land 5 frames late."""
+        def __init__(self, c):
+            self.c = c
+        def set(self, prop, v):
+            if prop == cv2.CAP_PROP_POS_FRAMES:
+                v = v + 5
+            return self.c.set(prop, v)
+        def __getattr__(self, k):
+            return getattr(self.c, k)
+
+    r.close()
+    r.open(str(clip))
+    r.cap = LateSeek(r.cap)
+    bad = [i for i in rnd.sample(range(n), 60) + [150, 149, 148] if block_id(r.frame(i)) != i]
+    check(not bad, "VideoReader stays exact when the backend seek lands late")
+    r.close()
+    # Through the UI path (what Maya sync drives): _show_frame -> displayed frame
+    w._open_video_path(str(clip))
+    for idx in (200, 17, 199, 250):
+        w._show_frame(idx)
+        got = block_id(w.reader.frame(w.canvas.current_frame))
+        check(got == idx, f"_show_frame({idx}) displays decoded frame {idx}")
+
+
+FEATURE_TESTS = [test_frame_accurate_seek]
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="inkit_smoke_"))
     clip = tmp / "shot_test.mp4"
@@ -77,8 +120,8 @@ def main() -> int:
     w._open_scene_path(str(scene))
     check(w.project.annotated_frames() == [20], "scene round-trip keeps drawing on frame 20")
 
-    if hasattr(sys.modules[__name__], "extra_checks"):
-        extra_checks(w, tmp, qapp)  # noqa: F821  (defined by later feature tests)
+    for fn in FEATURE_TESTS:
+        fn(w, tmp, qapp)
 
     w._close_clip()
     w.close()
