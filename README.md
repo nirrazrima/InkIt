@@ -128,7 +128,7 @@ build.bat
 
 It creates/uses `.venv`, installs `requirements.txt`, runs a compile check and then `pyinstaller --clean --noconfirm InkIt.spec`. The result is `dist\InkIt.exe`.
 
-CI: `.github/workflows/build.yml` builds the exe on `windows-latest` for every push / pull request (download it from the run's **Artifacts**), runs a headless smoke test, and publishes a GitHub Release with the exe attached when you push a tag such as `v1.2.0`:
+CI: `.github/workflows/build.yml` (currently staged as `ci/build.yml` — move it into `.github/workflows/` to enable it) builds the exe on `windows-latest` for every push / pull request (download it from the run's **Artifacts**), runs a headless smoke test, and publishes a GitHub Release with the exe attached when you push a tag such as `v1.2.0`:
 
 ```
 git tag v1.2.0
