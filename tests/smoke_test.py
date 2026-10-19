@@ -92,7 +92,93 @@ def test_frame_accurate_seek(w, tmp: Path, qapp) -> None:
         check(got == idx, f"_show_frame({idx}) displays decoded frame {idx}")
 
 
-FEATURE_TESTS = [test_frame_accurate_seek]
+def test_start_frame(w, tmp: Path, qapp) -> None:
+    """Start frame: detection, click-to-type, drag-scrub, labels, scene + Maya mapping."""
+    import socket
+    import threading
+    from PySide6.QtCore import QPoint, Qt as _Qt
+    from PySide6.QtTest import QTest
+
+    check(app.detect_start_frame("sh010_anim.1001-1100.mov") == 1001, "detect 1001 from 'x.1001-1100.mov'")
+    check(app.detect_start_frame("sh010_fr6586.mp4") == 6586, "detect 6586 from 'x_fr6586.mp4'")
+    check(app.detect_start_frame("sh010_v003.mp4") is None, "no false start frame from a version number")
+
+    clip = tmp / "sh020_1001-1047.mp4"
+    make_clip(clip)
+    w._open_video_path(str(clip))
+    check(w.project.start_frame == 1001, "start frame auto-detected on open (1001)")
+    check(w.box_start.value() == 1001, "start box shows 1001")
+    w._show_frame(5)
+    check(w.lbl_time.text() == "Frame 1006 / 1048", f"counter honours start ({w.lbl_time.text()})")
+
+    # click without drag -> inline editor; type 6586 + Enter
+    box = w.box_start
+    QTest.mouseClick(box, _Qt.MouseButton.LeftButton, pos=QPoint(40, 15))
+    qapp.processEvents()
+    check(box._edit.isVisible(), "click opens inline start-frame editor")
+    box._edit.selectAll()
+    QTest.keyClicks(box._edit, "6586")
+    QTest.keyClick(box._edit, _Qt.Key.Key_Return)
+    qapp.processEvents()
+    check(w.project.start_frame == 6586, f"typed start frame applied ({w.project.start_frame})")
+    check(w.lbl_time.text().startswith("Frame 6591"), "counter relabelled after typing")
+
+    # click-drag scrub: +40 px -> +10 frames at 4 px/step
+    QTest.mousePress(box, _Qt.MouseButton.LeftButton, pos=QPoint(40, 15))
+    QTest.mouseMove(box, QPoint(60, 15))
+    QTest.mouseMove(box, QPoint(80, 15))
+    QTest.mouseRelease(box, _Qt.MouseButton.LeftButton, pos=QPoint(80, 15))
+    qapp.processEvents()
+    check(w.project.start_frame == 6596 and not box._edit.isVisible(), f"drag scrubs start frame (+10 -> {w.project.start_frame})")
+
+    # scene round-trip keeps it
+    scene = tmp / "sh020.inkit"
+    scene.write_text(json.dumps(w.project.to_json()), encoding="utf-8")
+    w._set_start_frame(1)
+    w._open_scene_path(str(scene))
+    check(w.project.start_frame == 6596, "start frame restored from scene")
+    old = json.loads(scene.read_text())
+    old.pop("start_frame")
+    w._settings["start_frames"] = {}
+    legacy = tmp / "legacy.inkit"
+    legacy.write_text(json.dumps(old), encoding="utf-8")
+    check(app.Project().start_frame == 0, "legacy default start frame is 0")
+
+    # Maya mapping: Maya frame N == InkIt frame N when offset 0
+    w._set_start_frame(1001)
+    w._maya_offsets.pop(str(clip), None)
+    w._load_maya_offset_for_path(str(clip))
+    check(w._maya_offset == 0, "Maya offset defaults to 0 for numbered clips")
+    w._settings["maya_sync"] = True
+    w._apply_maya_frame(1010)
+    w._process_maya_pending()
+    check(w.canvas.current_frame == 9 and w.lbl_time.text().startswith("Frame 1010"), "Maya 1010 -> InkIt frame 1010 (index 9)")
+    got: list[str] = []
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    w._maya_send_port = srv.getsockname()[1]
+    w._maya_send_fail_until = 0
+
+    def serve():
+        srv.settimeout(2)
+        for _ in range(2):
+            try:
+                c, _a = srv.accept()
+                got.append(c.recv(100).decode().strip())
+                c.close()
+            except Exception:
+                break
+    t = threading.Thread(target=serve)
+    t.start()
+    w._show_frame(20)
+    t.join()
+    srv.close()
+    w._settings["maya_sync"] = False
+    check("FRAME 1021" in got and "APPFRAME 1021" in got, f"InkIt 1021 sends Maya FRAME/APPFRAME 1021 ({got})")
+
+
+FEATURE_TESTS = [test_frame_accurate_seek, test_start_frame]
 
 
 def main() -> int:

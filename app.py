@@ -77,6 +77,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -124,6 +125,7 @@ from PySide6.QtGui import (
     QGuiApplication,
     QIcon,
     QImage,
+    QIntValidator,
     QKeySequence,
     QPainter,
     QPainterPath,
@@ -272,6 +274,13 @@ class Project:
         # Always-visible overlay layer (arcs / tracking marks) drawn on top of
         # every frame; NOT tied to any specific frame.
         self.overlay_strokes: list[Stroke] = []
+        # First frame NUMBER shown to the user (0, 1, 1001, 6586, ...). Frames
+        # stay 0-based internally; only display / export / Maya use the offset.
+        self.start_frame: int = 0
+
+    def display_frame(self, f: int) -> int:
+        """User-facing frame number for internal 0-based frame `f`."""
+        return int(f) + int(self.start_frame)
 
     def strokes_at(self, f: int) -> list[Stroke]:
         return self.strokes.setdefault(f, [])
@@ -300,6 +309,7 @@ class Project:
             "height": self.height,
             "strokes": {str(k): [stroke_d(s) for s in v] for k, v in self.strokes.items() if v},
             "overlay_strokes": [stroke_d(s) for s in self.overlay_strokes],
+            "start_frame": int(self.start_frame),
         }
 
     def load_json(self, data: dict, scene_dir: Path | None = None) -> None:
@@ -321,6 +331,8 @@ class Project:
             self.width = int(data["width"])
         if data.get("height"):
             self.height = int(data["height"])
+        # Older scenes have no start frame: they keep displaying from 0
+        self.start_frame = int(data.get("start_frame", 0) or 0)
         for k, arr in data.get("strokes", {}).items():
             self.strokes[int(k)] = [
                 Stroke(
@@ -533,6 +545,27 @@ def _is_image_path(p: str | Path) -> bool:
     return str(p).lower().endswith(IMAGE_EXTS)
 
 
+def detect_start_frame(path: str | Path | None) -> int | None:
+    """Best-effort start frame from a media file name, or None if unknown.
+
+    Recognised:  shot_010.1001-1100.mov  /  shot_1001-1100.mp4   -> 1001
+                 shot.f1001.mov / shot_fr6586.mov                -> 1001 / 6586
+    Image sequences report their first frame number elsewhere.
+    """
+    if not path:
+        return None
+    stem = Path(str(path)).stem
+    m = re.search(r"(?<!\d)(\d{1,7})\s*[-_]\s*(\d{1,7})$", stem)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if b > a:
+            return a
+    m = re.search(r"[._-](?:f|fr|frame)(\d{1,7})$", stem, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 DEFAULT_PRESSURE_CURVE = [[0.0, 0.02], [1.0, 1.0]]  # hairline at zero press -> full pen size
 
 
@@ -644,6 +677,8 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "frame_overlay": "Ctrl+Shift+H",
     "queue_panel": "Ctrl+L",
     "time_mode": "Ctrl+T",
+    "goto_frame": "Ctrl+G",
+    "start_frame": "Ctrl+Shift+F",
     "show_thumbs": "Ctrl+Shift+T",
     "settings": "Ctrl+,",
     # -- Playback -----------------------------------------------------
@@ -686,6 +721,8 @@ ACTION_LABELS: dict[str, str] = {
     "frame_overlay": "Frame counter overlay",
     "queue_panel": "Shot list",
     "time_mode": "Frames / time display",
+    "goto_frame": "Go to frame…",
+    "start_frame": "Set start frame…",
     "show_thumbs": "Show thumbnails",
     "settings": "Settings…",
     "play_pause": "Play / pause",
@@ -727,6 +764,8 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "frame_overlay": "Frame counter badge in the canvas corner",
     "queue_panel": "Show or hide the shot list panel",
     "time_mode": "Switch timeline between frames and timecode",
+    "goto_frame": "Type a frame number to jump to",
+    "start_frame": "Type the first frame number of this clip (e.g. 1001)",
     "show_thumbs": "Show or hide shot list thumbnails",
     "settings": "Open the settings dialog",
     "play_pause": "Play or pause playback",
@@ -2268,6 +2307,150 @@ class ValueBox(QWidget):
     def _refresh_button_states(self) -> None:
         self.plus_btn.setEnabled(self._value < self._max)
         self.minus_btn.setEnabled(self._value > self._min)
+
+
+class FrameNumberBox(QWidget):
+    """
+    Drag-to-edit frame number field (start frame), styled like ValueBox and
+    driven like BoxSlider's relative drag:
+      * click (no drag)  -> type a value inline, Enter/focus-out commits, Esc cancels
+      * click-drag left/right -> scrub the value (Shift = x10, Ctrl = fine)
+      * mouse wheel -> +/- 1
+    """
+
+    valueChanged = Signal(int)
+
+    PX_PER_STEP = 4.0
+
+    def __init__(self, caption: str = "Start", value: int = 0, minimum: int = -999999, maximum: int = 9999999, parent=None) -> None:
+        super().__init__(parent)
+        self._min = int(minimum)
+        self._max = int(maximum)
+        self._value = min(max(int(value), self._min), self._max)
+        self.caption = caption
+        self._drag = False
+        self._moved = False
+        self._press_x = 0.0
+        self._press_value = self._value
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "FrameNumberBox { background-color:#2b2b2b; border:1px solid #4a4a4a;"
+            " border-radius:6px; }"
+            "FrameNumberBox:hover { border-color:#5285a6; }"
+        )
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setFixedSize(92, 30)
+        self._edit = QLineEdit(self)
+        self._edit.setValidator(QIntValidator(self._min, self._max, self))
+        self._edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._edit.setStyleSheet(
+            "QLineEdit { background:#1e1e22; color:white; border:1px solid #5285a6;"
+            " border-radius:5px; font-size:12px; font-weight:bold; padding:0 6px; }"
+        )
+        self._edit.hide()
+        self._edit.returnPressed.connect(self._commit_edit)
+        self._edit.editingFinished.connect(self._commit_edit)
+        self._edit.installEventFilter(self)
+
+    def value(self) -> int:
+        return self._value
+
+    def setValue(self, v: int, emit: bool = True) -> None:
+        v = min(max(int(v), self._min), self._max)
+        if v == self._value:
+            return
+        self._value = v
+        self.update()
+        if emit:
+            self.valueChanged.emit(v)
+
+    # -- inline typing -----------------------------------------------------
+    def begin_edit(self) -> None:
+        self._edit.setGeometry(self.rect().adjusted(1, 1, -1, -1))
+        self._edit.setText(str(self._value))
+        self._edit.show()
+        self._edit.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._edit.selectAll()
+
+    def _commit_edit(self) -> None:
+        if not self._edit.isVisible():
+            return
+        txt = self._edit.text().strip()
+        self._edit.hide()
+        if txt and txt not in ("-", "+"):
+            try:
+                self.setValue(int(txt))
+            except ValueError:
+                pass
+
+    def eventFilter(self, obj, ev) -> bool:
+        if obj is self._edit and ev.type() == QEvent.Type.KeyPress and ev.key() == Qt.Key.Key_Escape:
+            self._edit.blockSignals(True)
+            self._edit.hide()
+            self._edit.blockSignals(False)
+            return True
+        return super().eventFilter(obj, ev)
+
+    # -- drag scrubbing ------------------------------------------------------
+    def mousePressEvent(self, ev) -> None:
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._drag = True
+            self._moved = False
+            self._press_x = ev.position().x()
+            self._press_value = self._value
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev) -> None:
+        if self._drag:
+            dx = ev.position().x() - self._press_x
+            if abs(dx) >= 3:
+                self._moved = True
+            if self._moved:
+                mods = ev.modifiers()
+                step = self.PX_PER_STEP
+                if mods & Qt.KeyboardModifier.ControlModifier:
+                    step *= 4.0
+                mult = 10 if (mods & Qt.KeyboardModifier.ShiftModifier) else 1
+                self.setValue(self._press_value + int(dx / step) * mult)
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if self._drag and ev.button() == Qt.MouseButton.LeftButton:
+            self._drag = False
+            if not self._moved:
+                self.begin_edit()
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
+    def wheelEvent(self, ev) -> None:
+        d = ev.angleDelta().y()
+        if d:
+            self.setValue(self._value + (1 if d > 0 else -1))
+            ev.accept()
+            return
+        super().wheelEvent(ev)
+
+    def paintEvent(self, ev) -> None:
+        super().paintEvent(ev)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(8, 0, -8, 0)
+        f = p.font()
+        f.setPointSizeF(max(7.0, f.pointSizeF() - 1.0))
+        p.setFont(f)
+        p.setPen(QColor("#8a8a95"))
+        p.drawText(r, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), self.caption)
+        f.setBold(True)
+        f.setPointSizeF(f.pointSizeF() + 1.0)
+        p.setFont(f)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(r, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), str(self._value))
+        p.end()
 
 
 class VolumeButton(QPushButton):
@@ -5947,6 +6130,12 @@ class MainWindow(QMainWindow):
         self.slider.valueChanged.connect(self._scrub)
         play.addWidget(self.slider, 1)
 
+        # --- [FIELD] Start frame number (click to type, drag to scrub) ---
+        self.box_start = FrameNumberBox("Start", 0)
+        self.box_start.setToolTip("Start frame number — click to type, drag left/right to scrub (Shift ×10, Ctrl fine)")
+        self.box_start.valueChanged.connect(self._set_start_frame)
+        play.addWidget(self.box_start)
+
         # --- [LABEL] Timecode / Frame Number Mode Display ---
         self.lbl_time = ClickableLabel("—")
         self.lbl_time.setMinimumWidth(150)
@@ -6049,6 +6238,9 @@ class MainWindow(QMainWindow):
         self.act_fov.setCheckable(True)
         self.act_fov.setChecked(bool(self._settings.get("frame_overlay", False)))
         self.act_fov.toggled.connect(self._toggle_frame_overlay)
+        view.addSeparator()
+        view.addAction(self._act("goto_frame", self._prompt_goto_frame))
+        view.addAction(self._act("start_frame", lambda: self.box_start.begin_edit()))
 
         self._act("pen", self._toggle_tool)  # B toggles pen <-> eraser
         self._act("eraser", lambda: self._set_tool("eraser"))
@@ -6446,7 +6638,9 @@ class MainWindow(QMainWindow):
         self.project.height = h
         if keep_strokes is not None:
             self.project.strokes = keep_strokes
+        self.project.start_frame = self._initial_start_frame(path)
         self.canvas.project = self.project
+        self._sync_start_box()
         still = bool(self._is_still)
         board = bool(getattr(self.canvas, "is_board", False))
         self.slider.blockSignals(True)
@@ -7300,6 +7494,9 @@ class MainWindow(QMainWindow):
             "", max(proj.frame_count, 1), float(proj.fps or 24.0),
             int(proj.width or 1920), int(proj.height or 1080), keep_strokes=proj.strokes,
         )
+        self.project.start_frame = int(getattr(proj, "start_frame", 0) or 0)
+        self._sync_start_box()
+        self._update_time_label()
         self.project.scene_path = scene_path
         self.project.user_saved = not is_autosave_name(scene_path)
         self._push_recent("recent_open", scene_path)
@@ -7466,13 +7663,69 @@ class MainWindow(QMainWindow):
         self._push_app_frame(index)
 
 
+    # -----------------------------------------------------------------------
+    # Start frame number (display offset)
+    # -----------------------------------------------------------------------
+
+    def _initial_start_frame(self, path: str | None) -> int:
+        """Remembered start frame for this media, else auto-detected, else 0."""
+        if not path:
+            return 0
+        saved = (self._settings.get("start_frames", {}) or {}).get(self._notes_key(path))
+        if saved is not None:
+            return int(saved)
+        seq_start = getattr(self.reader, "seq_start", None) if self.reader.path == path else None
+        if seq_start is not None:
+            return int(seq_start)
+        det = detect_start_frame(path)
+        return int(det) if det is not None else 0
+
+    def _sync_start_box(self) -> None:
+        if hasattr(self, "box_start"):
+            self.box_start.setValue(int(self.project.start_frame), emit=False)
+
+    def _set_start_frame(self, value: int) -> None:
+        """User changed the start frame: re-label everything, remember per clip."""
+        value = int(value)
+        if value == int(self.project.start_frame):
+            return
+        self.project.start_frame = value
+        path = getattr(self.project, "path", "") or ""
+        if path:
+            sf = dict(self._settings.get("start_frames", {}) or {})
+            sf[self._notes_key(path)] = value
+            self._settings["start_frames"] = sf
+            if str(path) not in self._maya_offsets and value != 0:
+                self._maya_offset = 0
+        self._sync_start_box()
+        self._update_time_label()
+        self._refresh_marks()
+        self._schedule_save()
+        self._autosave_timer.start(250)
+        self._maybe_send_to_maya(self.canvas.current_frame)
+        self._push_app_frame(self.canvas.current_frame)
+        self.statusBar().showMessage(f"Start frame: {value}", 2500)
+
+    def _prompt_goto_frame(self) -> None:
+        """Type a frame NUMBER (honouring the start frame) to jump to."""
+        if self.project.frame_count <= 0:
+            return
+        start = int(self.project.start_frame)
+        cur = self.project.display_frame(self.canvas.current_frame)
+        val, ok = QInputDialog.getInt(
+            self, "Go to frame", "Frame number:", cur, start, start + self.project.frame_count - 1, 1
+        )
+        if ok:
+            self._show_frame(int(val) - start)
+
     def _update_time_label(self) -> None:
+        start = int(getattr(self.project, "start_frame", 0) or 0)
         f = self.canvas.current_frame
         n = max(self.project.frame_count - 1, 0)
         fps = self.project.fps or 24.0
         if self.time_mode == "frames":
-            self.lbl_time.setText(f"Frame {f} / {n}")
-            self.canvas.frame_overlay_text = f"{f}"
+            self.lbl_time.setText(f"Frame {f + start} / {n + start}")
+            self.canvas.frame_overlay_text = f"{f + start}"
         else:
             t = format_time(f, fps)
             self.lbl_time.setText(f"{t}  /  {format_time(n, fps)}")
@@ -8062,7 +8315,7 @@ Start-Sleep -Milliseconds 80
         self._maya_server = srv
         self._update_maya_status_indicator()
         if not silent:
-            self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset}  Maya {self._maya_offset}=InkIt 0)", 4000)
+            self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset}  Maya {self._maya_offset + int(self.project.start_frame)}=InkIt {int(self.project.start_frame)})", 4000)
 
     def _stop_maya_server(self) -> None:
         if self._maya_server is not None:
@@ -8205,7 +8458,7 @@ Start-Sleep -Milliseconds 80
             return
         if self.project.frame_count <= 0:
             return
-        inkit = int(maya_frame) - int(self._maya_offset)
+        inkit = int(maya_frame) - int(self._maya_offset) - int(self.project.start_frame)
         inkit = max(0, min(inkit, int(self.project.frame_count) - 1))
         # coalesce — Maya may send 60fps during drag/play, process at display rate
         self._maya_pending_frame = inkit
@@ -8254,15 +8507,19 @@ Start-Sleep -Milliseconds 80
         if save:
             self._schedule_save()
         self._update_maya_status_indicator()
-        self.statusBar().showMessage(f"Maya offset: Maya {offset} = InkIt 0  (Maya {offset}+{self.canvas.current_frame}=InkIt {self.canvas.current_frame})", 4000)
+        cur = self.project.display_frame(self.canvas.current_frame)
+        self.statusBar().showMessage(f"Maya offset: {offset}  (InkIt {cur} = Maya {cur + int(offset)})", 4000)
 
     def _prompt_maya_offset(self) -> None:
         cur = int(self._maya_offset)
         # suggest current Maya frame as zero mapping
-        hint = f"Which Maya frame should equal InkIt 0?\nCurrent: Maya {cur} = InkIt 0  (InkIt {self.canvas.current_frame} is Maya {cur + int(self.canvas.current_frame)})"
-        val, ok = QInputDialog.getInt(self, "Maya Start Frame", hint, cur, -1000000, 1000000, 1)
+        start = int(self.project.start_frame)
+        disp = self.project.display_frame(self.canvas.current_frame)
+        hint = (f"Which Maya frame should equal InkIt frame {start} (the clip's first frame)?\n"
+                f"Current: Maya {cur + start} = InkIt {start}  (InkIt {disp} is Maya {cur + disp})")
+        val, ok = QInputDialog.getInt(self, "Maya Start Frame", hint, cur + start, -1000000, 10000000, 1)
         if ok:
-            self._set_maya_offset(int(val), save=True)
+            self._set_maya_offset(int(val) - start, save=True)
             if self._maya_server is not None:
                 self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset})", 3000)
 
@@ -8272,6 +8529,9 @@ Start-Sleep -Milliseconds 80
         off = self._maya_offsets.get(str(path))
         if off is not None:
             self._maya_offset = int(off)
+        elif int(getattr(self.project, "start_frame", 0) or 0) != 0:
+            # Clip carries real frame numbers (e.g. 1001): Maya frame == InkIt frame
+            self._maya_offset = 0
 
     def _maybe_send_to_maya(self, inkit_frame: int) -> None:
         if not bool(self._settings.get("maya_sync", False)):
@@ -8282,7 +8542,7 @@ Start-Sleep -Milliseconds 80
             return
         try:
             import socket
-            maya_frame = int(inkit_frame) + int(self._maya_offset)
+            maya_frame = int(inkit_frame) + int(self.project.start_frame) + int(self._maya_offset)
             s = socket.socket()
             s.settimeout(0.015)
             s.connect(("127.0.0.1", int(self._maya_send_port)))
@@ -8302,7 +8562,7 @@ Start-Sleep -Milliseconds 80
             s = socket.socket()
             s.settimeout(0.015)
             s.connect(("127.0.0.1", int(self._maya_send_port)))
-            s.sendall(f"APPFRAME {int(inkit_frame)}\n".encode())
+            s.sendall(f"APPFRAME {int(inkit_frame) + int(self.project.start_frame)}\n".encode())
             s.close()
         except Exception:
             self._maya_send_fail_until = time.time() + 1.0
@@ -8754,6 +9014,11 @@ Start-Sleep -Milliseconds 80
         else:
             ok = self._open_video_path(proj.path, strokes=proj.strokes)
         if ok:
+            if "start_frame" in data:
+                self.project.start_frame = int(data.get("start_frame") or 0)
+                self._sync_start_box()
+                self._load_maya_offset_for_path(self.project.path)
+                self._update_time_label()
             self.project.scene_path = path
             self.project.user_saved = not is_autosave_name(path)
             self._settings["last_open_dir"] = str(Path(path).parent)
