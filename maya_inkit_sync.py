@@ -689,7 +689,7 @@ if not _inkit_silent_install:
     cmds.rowLayout("inkit_inkitRow", numberOfColumns=4, columnWidth4=(62, 112, 50, 10), adjustableColumn=4, columnAttach=[(1, "left", 0), (2, "left", 6), (3, "left", 6)])
     cmds.text("inkit_inkitLabel", label="Inkit", font="boldLabelFont", width=58, align="left")
     cmds.button("inkit_inkitBtn", label="Current Frame", width=108, height=22, backgroundColor=[0.43, 0.43, 0.43], command=_sync_inkit_frame)
-    cmds.intField("inkit_inkitField", value=0, width=50, height=22, preventOverride=True, changeCommand=_apply_link)
+    cmds.intField("inkit_inkitField", value=1, width=50, height=22, preventOverride=True, changeCommand=_apply_link)
     cmds.setParent("..")
 
     if _DRAW_ICON_PREV and _DRAW_ICON_NEXT:

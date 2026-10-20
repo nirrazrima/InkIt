@@ -50,18 +50,18 @@ If you are an UI/UX artists and interested in the tool please get in touch to ma
 - Persist your work in a lightweight scene file that opens right back up with all frames and strokes intact — with **autosave** in the background so you never lose work.
 
 ### Review tools
-- **Start frame number**: the **Start** field next to the frame counter sets the first frame number of the clip (0, 1, 1001, 6586…). Click it to type a value, or click-drag left/right to scrub it (Shift ×10, Ctrl fine, wheel ±1). It is auto-detected from image-sequence numbering and from names like `shot.1001-1100.mov` or `shot_fr6586.mov`, saved in the scene, remembered per clip, and used by the counter, the frame HUD, **Go to frame** (`Ctrl+G`), notes, exports and Maya sync (with a numbered clip, Maya frame 1001 = InkIt frame 1001).
+- **Frame numbers always start at 1**: the first frame of every clip, image sequence or board is frame **1** — in the counter, the frame HUD, **Go to frame** (`Ctrl+G`), the timeline, notes, review sheets, exports and A/B compare. Numbers in file names (e.g. `shot.1001.png`) don't change this; use the Maya offset to line up with Maya's frame numbers. Timecode still counts from `0:00:00`.
 - **Typed review notes**: `N` adds a note; its From / To frame fields default to the current frame (click to type or drag to make it a range, also when editing). Notes appear as a caption on the canvas, as cyan ticks on the timeline and in the **Review Notes** sidebar (`Ctrl+Shift+N`; click = jump, double-click = edit, Del = remove). They are saved in the `.inkit` scene (older scenes still open).
 - **Review sheet** (`Ctrl+Shift+R`): exports a CSV plus an HTML page with an annotated thumbnail for every note and every drawn frame.
-- **Annotated frames + contact sheet** (`Ctrl+Shift+E`): writes every drawn / noted frame as `shot.1001.png` (real frame numbers, drawings burned in) plus `shot_contact_sheet.png`.
-- **A/B compare** (`Ctrl+Shift+B` to load B, `Ctrl+Shift+C` to cycle): wipe or side-by-side against a second clip or sequence, locked by frame number (B has its own **B start**); your drawings stay on A.
+- **Annotated frames + contact sheet** (`Ctrl+Shift+E`): writes every drawn / noted frame as `shot.0001.png` (InkIt frame numbers, first frame = 1, drawings burned in) plus `shot_contact_sheet.png`.
+- **A/B compare** (`Ctrl+Shift+B` to load B, `Ctrl+Shift+C` to cycle): wipe or side-by-side against a second clip or sequence, locked frame for frame (B frame 1 = A frame 1; B holds its last frame if it is shorter); your drawings stay on A.
 - **Image sequences** (`Ctrl+Alt+O`, or drop a folder): numbered PNG / JPG / TIFF / EXR frames open as a clip; missing numbers hold the previous frame. EXR is shown linear → sRGB.
 - **Frame rate override** (`Ctrl+Alt+F`): set playback / export fps (sequences default to 24). Saved per scene; a retimed video plays without audio.
 - **Frame-accurate seeking**: random access is verified by frame timestamps and backed by a small frame cache, so long-GOP H.264 playblasts land on the exact frame when scrubbing, stepping or syncing with Maya.
 
 ### Sync to Maya for animation review
 - InkIt and Autodesk Maya talk over a local two-way connection, letting you review animation directly against a frame-accurate playblast while keeping both apps in sync.
-- Use the **InkIt Sync** panel/shelf button in Maya to match InkIt to Maya's current frame — live, including during playback or scrubbing — with a configurable **frame offset** so Maya frames map exactly to your InkIt frames (offsets are remembered per scene).
+- Use the **InkIt Sync** panel/shelf button in Maya to match InkIt to Maya's current frame — live, including during playback or scrubbing — with a configurable **frame offset**: **Maya frame = InkIt frame + offset**, both ways. With no offset (the default) InkIt 1 = Maya 1; for a Maya shot starting at 1001 the offset is 1000 (Maya 1001 = InkIt 1). Set it from the Maya panel (type the Maya / InkIt pair) or InkIt's Maya Start Frame prompt; offsets are remembered per clip. Offsets saved by older builds are converted once so they still hit the same Maya frames.
 - Go straight to the **next/previous drawing** from Maya, and let InkIt drive or follow playback so review stays in lockstep.
 - Sync starts **off** on every launch and is enabled only when you turn it on.
 

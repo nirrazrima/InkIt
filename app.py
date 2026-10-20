@@ -124,7 +124,6 @@ from PySide6.QtCore import (
     QPointF,
     QRect,
     QRectF,
-    QSettings,
     QSize,
     Qt,
     QThread,
@@ -281,6 +280,9 @@ class Stroke:
     hardness: float = 1.0  # 0=soft .. 1=hard
 
 
+FIRST_FRAME = 1  # displayed number of every clip's first frame
+
+
 class Project:
     def __init__(self) -> None:
         self.path: str | None = None
@@ -294,9 +296,6 @@ class Project:
         # Always-visible overlay layer (arcs / tracking marks) drawn on top of
         # every frame; NOT tied to any specific frame.
         self.overlay_strokes: list[Stroke] = []
-        # First frame NUMBER shown to the user (0, 1, 1001, 6586, ...). Frames
-        # stay 0-based internally; only display / export / Maya use the offset.
-        self.start_frame: int = 0
         # Typed review notes: [{"start": f0, "end": f1, "text": "..."}] with
         # 0-based inclusive frame range (start == end for a single frame).
         self.text_notes: list[dict] = []
@@ -312,9 +311,12 @@ class Project:
         """First frame of every typed note (timeline markers)."""
         return sorted({int(n["start"]) for n in self.text_notes})
 
+    # Frames are 0-based internally; the clip's first frame is ALWAYS shown as 1.
+    start_frame = 1  # read-only: no per-clip / per-scene start numbers
+
     def display_frame(self, f: int) -> int:
-        """User-facing frame number for internal 0-based frame `f`."""
-        return int(f) + int(self.start_frame)
+        """User-facing frame number for internal 0-based frame `f` (first = 1)."""
+        return int(f) + FIRST_FRAME
 
     def strokes_at(self, f: int) -> list[Stroke]:
         return self.strokes.setdefault(f, [])
@@ -343,7 +345,6 @@ class Project:
             "height": self.height,
             "strokes": {str(k): [stroke_d(s) for s in v] for k, v in self.strokes.items() if v},
             "overlay_strokes": [stroke_d(s) for s in self.overlay_strokes],
-            "start_frame": int(self.start_frame),
             "fps_override": self.fps_override,
             "text_notes": [
                 {"start": int(n["start"]), "end": int(n["end"]), "text": str(n.get("text", ""))}
@@ -370,8 +371,7 @@ class Project:
             self.width = int(data["width"])
         if data.get("height"):
             self.height = int(data["height"])
-        # Older scenes have no start frame: they keep displaying from 0
-        self.start_frame = int(data.get("start_frame", 0) or 0)
+        # Older scenes may carry "start_frame": ignored — the first frame is always 1
         fo = data.get("fps_override")
         self.fps_override = float(fo) if fo else None
         self.text_notes = []
@@ -556,7 +556,7 @@ class VideoReader:
         self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
         self._cache_max = 64
         self.is_sequence = False
-        self.seq_start: int | None = None  # first frame number of an image sequence
+
 
     def open(self, path: str) -> tuple[int, float, int, int]:
         """Opens a video file or image-sequence pattern; returns (frame_count, fps, width, height)."""
@@ -564,7 +564,6 @@ class VideoReader:
         if is_sequence_path(path):
             return self._open_sequence(path)
         self.is_sequence = False
-        self.seq_start = None
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video:\n{path}")
@@ -613,7 +612,6 @@ class VideoReader:
         self.cap = _SequenceCapture(files)  # type: ignore[assignment]
         self.path = pattern
         self.is_sequence = True
-        self.seq_start = int(first)
         self.fps = 24.0
         self.count = len(files)
         h, w = bgr.shape[:2]
@@ -746,27 +744,6 @@ def _is_image_path(p: str | Path) -> bool:
     return str(p).lower().endswith(IMAGE_EXTS)
 
 
-def detect_start_frame(path: str | Path | None) -> int | None:
-    """Best-effort start frame from a media file name, or None if unknown.
-
-    Recognised:  shot_010.1001-1100.mov  /  shot_1001-1100.mp4   -> 1001
-                 shot.f1001.mov / shot_fr6586.mov                -> 1001 / 6586
-    Image sequences report their first frame number elsewhere.
-    """
-    if not path:
-        return None
-    stem = Path(str(path)).stem
-    m = re.search(r"(?<!\d)(\d{1,7})\s*[-_]\s*(\d{1,7})$", stem)
-    if m:
-        a, b = int(m.group(1)), int(m.group(2))
-        if b > a:
-            return a
-    m = re.search(r"[._-](?:f|fr|frame)(\d{1,7})$", stem, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    return None
-
-
 DEFAULT_PRESSURE_CURVE = [[0.0, 0.02], [1.0, 1.0]]  # hairline at zero press -> full pen size
 
 
@@ -887,7 +864,6 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "add_note": "N",
     "notes_panel": "Ctrl+Shift+N",
     "export_review": "Ctrl+Shift+R",
-    "start_frame": "Ctrl+Shift+F",
     "show_thumbs": "Ctrl+Shift+T",
     "settings": "Ctrl+,",
     # -- Playback -----------------------------------------------------
@@ -939,7 +915,6 @@ ACTION_LABELS: dict[str, str] = {
     "add_note": "Add note…",
     "notes_panel": "Review Notes panel",
     "export_review": "Export review sheet…",
-    "start_frame": "Set start frame…",
     "show_thumbs": "Show thumbnails",
     "settings": "Settings…",
     "play_pause": "Play / pause",
@@ -990,7 +965,6 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "add_note": "Add a typed note on the current frame or a frame range",
     "notes_panel": "Show / hide the typed review notes sidebar",
     "export_review": "Export typed notes + drawn frames as CSV and an HTML sheet with thumbnails",
-    "start_frame": "Type the first frame number of this clip (e.g. 1001)",
     "show_thumbs": "Show or hide shot list thumbnails",
     "settings": "Open the settings dialog",
     "play_pause": "Play or pause playback",
@@ -2553,7 +2527,7 @@ class ValueBox(QWidget):
 
 class FrameNumberBox(QWidget):
     """
-    Drag-to-edit frame number field (start frame), styled like ValueBox and
+    Drag-to-edit frame number field (note From / To frames), styled like ValueBox and
     driven like BoxSlider's relative drag:
       * click (no drag)  -> type a value inline, Enter/focus-out commits, Esc cancels
       * click-drag left/right -> scrub the value (Shift = x10, Ctrl = fine)
@@ -2704,7 +2678,7 @@ class NoteDialog(QDialog):
         self.setMinimumWidth(420)
         lay = QVBoxLayout(self)
         row = QHBoxLayout()
-        # Same click-to-type / drag-to-scrub control as the Start frame box
+        # Same click-to-type / drag-to-scrub control as the other frame-number fields
         self.sp_start = FrameNumberBox("From", int(start), int(first), int(last))
         self.sp_end = FrameNumberBox("To", int(end), int(first), int(last))
         for sp in (self.sp_start, self.sp_end):
@@ -3376,7 +3350,7 @@ def default_settings() -> dict:
         "pen_recent": ["#ff3b30", "#ffcc00", "#34c759", "#007aff", "#ffffff", "#000000"],
         "fade_recent": ["#ffffff", "#000000", "#888888"],
         "maya_sync": False,
-        "maya_offset": 10045,
+        "maya_offset": 0,  # Maya frame = InkIt frame number + offset (0: InkIt 1 = Maya 1)
         "maya_offsets": {},
         "maya_port": 6005,
         "maya_send_port": 6006,
@@ -6040,7 +6014,8 @@ class MainWindow(QMainWindow):
         self._vol_dragged = False
         # Maya live sync (scrub Maya <-> scrub InkIt) — per-shot offset support
         self._maya_server = None
-        self._maya_offset = int(self._settings.get("maya_offset", 10045))
+        self._migrate_maya_offsets()
+        self._maya_offset = int(self._settings.get("maya_offset", 0))
         self._maya_offsets: dict[str, int] = dict(self._settings.get("maya_offsets", {}) or {})
         self._maya_port = int(self._settings.get("maya_port", 6005))
         self._maya_send_port = int(self._settings.get("maya_send_port", 6006))
@@ -6516,12 +6491,6 @@ class MainWindow(QMainWindow):
         self.slider.valueChanged.connect(self._scrub)
         play.addWidget(self.slider, 1)
 
-        # --- [FIELD] Start frame number (click to type, drag to scrub) ---
-        self.box_start = FrameNumberBox("Start", 0)
-        self.box_start.setToolTip("Start frame number — click to type, drag left/right to scrub (Shift ×10, Ctrl fine)")
-        self.box_start.valueChanged.connect(self._set_start_frame)
-        play.addWidget(self.box_start)
-
         # --- [LABEL] Timecode / Frame Number Mode Display ---
         self.lbl_time = ClickableLabel("—")
         self.lbl_time.setMinimumWidth(150)
@@ -6654,7 +6623,6 @@ class MainWindow(QMainWindow):
         view.addSeparator()
         view.addAction(self._act("compare_load", self.load_compare_clip))
         view.addAction(self._act("compare_mode", self._cycle_compare_mode))
-        view.addAction(self._act("start_frame", lambda: self.box_start.begin_edit()))
 
         self._act("pen", self._toggle_tool)  # B toggles pen <-> eraser
         self._act("eraser", lambda: self._set_tool("eraser"))
@@ -7059,10 +7027,8 @@ class MainWindow(QMainWindow):
         self.project.height = h
         if keep_strokes is not None:
             self.project.strokes = keep_strokes
-        self.project.start_frame = self._initial_start_frame(path)
         self.project.text_notes = list(self._session_text_notes.pop(self._notes_key(path), [])) if path else []
         self.canvas.project = self.project
-        self._sync_start_box()
         still = bool(self._is_still)
         board = bool(getattr(self.canvas, "is_board", False))
         self.slider.blockSignals(True)
@@ -8010,10 +7976,8 @@ class MainWindow(QMainWindow):
             "", max(proj.frame_count, 1), float(proj.fps or 24.0),
             int(proj.width or 1920), int(proj.height or 1080), keep_strokes=proj.strokes,
         )
-        self.project.start_frame = int(getattr(proj, "start_frame", 0) or 0)
         self.project.text_notes = list(getattr(proj, "text_notes", []))
         self._refresh_marks()
-        self._sync_start_box()
         self._update_time_label()
         self.project.scene_path = scene_path
         self.project.user_saved = not is_autosave_name(scene_path)
@@ -8223,10 +8187,6 @@ class MainWindow(QMainWindow):
         self.sl_b_op.valueChanged.connect(self._set_compare_opacity)
         self.canvas.compare_opacity = self.sl_b_op.value() / 100.0
         lay.addWidget(self.sl_b_op)
-        self.box_compare_start = FrameNumberBox("B start", 0)
-        self.box_compare_start.setToolTip("First frame number of clip B — B is locked to A by frame number (click to type, drag to scrub)")
-        self.box_compare_start.valueChanged.connect(self._set_compare_start)
-        lay.addWidget(self.box_compare_start)
         btn_swap = QPushButton("Load B…")
         btn_swap.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_swap.clicked.connect(self.load_compare_clip)
@@ -8255,7 +8215,6 @@ class MainWindow(QMainWindow):
         self._compare_bar = bar
         self.compare_reader = VideoReader()
         self.compare_path: str | None = None
-        self.compare_start = 0
         return bar
 
     def load_compare_clip(self, path: str | None = None) -> bool:
@@ -8280,12 +8239,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Compare A/B", str(e))
             return False
         self.compare_path = path
-        b_start = self.compare_reader.seq_start
-        if b_start is None:
-            b_start = detect_start_frame(path)
-        # Unnumbered B: lock frame-for-frame to A (same start number)
-        self.compare_start = int(b_start) if b_start is not None else int(self.project.start_frame)
-        self.box_compare_start.setValue(self.compare_start, emit=False)
         self.lbl_compare.setText(f"B: {Path(path).name}")
         self.canvas.compare_labels = (f"A  {media_stem(self.project.path)}", f"B  {media_stem(path)}")
         self._compare_bar.setVisible(True)
@@ -8337,14 +8290,9 @@ class MainWindow(QMainWindow):
         self.canvas.compare_wipe = max(0, min(100, int(v))) / 100.0
         self.canvas.update()
 
-    def _set_compare_start(self, v: int) -> None:
-        self.compare_start = int(v)
-        self._update_compare_frame(self.canvas.current_frame)
-        self.canvas.update()
-
     def compare_index_for(self, a_index: int) -> int:
-        """B frame index shown with A frame `a_index` (locked by frame NUMBER)."""
-        b = self.project.display_frame(a_index) - int(self.compare_start)
+        """B frame shown with A frame `a_index`: same number (B 1 = A 1), B holds its last frame."""
+        b = int(a_index)
         return max(0, min(b, max(self.compare_reader.count - 1, 0)))
 
     def _update_compare_frame(self, a_index: int) -> None:
@@ -8476,7 +8424,7 @@ class MainWindow(QMainWindow):
         if not self._clip_open():
             self.statusBar().showMessage("Open a clip first")
             return
-        start = int(self.project.start_frame)
+        start = FIRST_FRAME
         last = start + max(self.project.frame_count - 1, 0)
         cur = self.project.display_frame(self.canvas.current_frame)
         dlg = NoteDialog(self, start, last, cur, cur, "", "Add note")
@@ -8494,7 +8442,7 @@ class MainWindow(QMainWindow):
         if i is None or not (0 <= int(i) < len(self.project.text_notes)):
             return
         n = self.project.text_notes[int(i)]
-        start = int(self.project.start_frame)
+        start = FIRST_FRAME
         last = start + max(self.project.frame_count - 1, 0)
         dlg = NoteDialog(self, start, last, n["start"] + start, n["end"] + start, n.get("text", ""), "Edit note")
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -8733,70 +8681,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Review sheet saved: {html_path.name} + {csv_path.name}", 5000)
         return str(html_path)
 
-    # -----------------------------------------------------------------------
-    # Start frame number (display offset)
-    # -----------------------------------------------------------------------
-
-    def _initial_start_frame(self, path: str | None) -> int:
-        """Remembered start frame for this media, else auto-detected, else 0."""
-        if not path:
-            return 0
-        saved = (self._settings.get("start_frames", {}) or {}).get(self._notes_key(path))
-        if saved is not None:
-            return int(saved)
-        seq_start = getattr(self.reader, "seq_start", None) if self.reader.path == path else None
-        if seq_start is not None:
-            return int(seq_start)
-        det = detect_start_frame(path)
-        if det is not None:
-            return int(det)
-        return self._last_start_frame()
-
-    @staticmethod
-    def _qsettings() -> QSettings:
-        return QSettings("InkIt", "InkIt")
-
-    def _last_start_frame(self) -> int:
-        """Last start frame the user set anywhere (QSettings), default 0."""
-        try:
-            return int(self._qsettings().value("start_frame/last", 0))
-        except (TypeError, ValueError):
-            return 0
-
-    def _sync_start_box(self) -> None:
-        if hasattr(self, "box_start"):
-            self.box_start.setValue(int(self.project.start_frame), emit=False)
-
-    def _set_start_frame(self, value: int) -> None:
-        """User changed the start frame: re-label everything, remember per clip."""
-        value = int(value)
-        if value == int(self.project.start_frame):
-            return
-        self.project.start_frame = value
-        qs = self._qsettings()
-        qs.setValue("start_frame/last", value)
-        qs.sync()
-        path = getattr(self.project, "path", "") or ""
-        if path:
-            sf = dict(self._settings.get("start_frames", {}) or {})
-            sf[self._notes_key(path)] = value
-            self._settings["start_frames"] = sf
-            if str(path) not in self._maya_offsets and value != 0:
-                self._maya_offset = 0
-        self._sync_start_box()
-        self._update_time_label()
-        self._refresh_marks()
-        self._schedule_save()
-        self._autosave_timer.start(250)
-        self._maybe_send_to_maya(self.canvas.current_frame)
-        self._push_app_frame(self.canvas.current_frame)
-        self.statusBar().showMessage(f"Start frame: {value}", 2500)
-
     def _prompt_goto_frame(self) -> None:
-        """Type a frame NUMBER (honouring the start frame) to jump to."""
+        """Type a frame NUMBER (first frame = 1) to jump to."""
         if self.project.frame_count <= 0:
             return
-        start = int(self.project.start_frame)
+        start = FIRST_FRAME
         cur = self.project.display_frame(self.canvas.current_frame)
         val, ok = QInputDialog.getInt(
             self, "Go to frame", "Frame number:", cur, start, start + self.project.frame_count - 1, 1
@@ -8805,7 +8694,7 @@ class MainWindow(QMainWindow):
             self._show_frame(int(val) - start)
 
     def _update_time_label(self) -> None:
-        start = int(getattr(self.project, "start_frame", 0) or 0)
+        start = FIRST_FRAME
         f = self.canvas.current_frame
         n = max(self.project.frame_count - 1, 0)
         fps = self.project.fps or 24.0
@@ -9404,7 +9293,7 @@ Start-Sleep -Milliseconds 80
         self._maya_server = srv
         self._update_maya_status_indicator()
         if not silent:
-            self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset}  Maya {self._maya_offset + int(self.project.start_frame)}=InkIt {int(self.project.start_frame)})", 4000)
+            self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset}  Maya {self._maya_offset + FIRST_FRAME}=InkIt {FIRST_FRAME})", 4000)
 
     def _stop_maya_server(self) -> None:
         if self._maya_server is not None:
@@ -9537,17 +9426,18 @@ Start-Sleep -Milliseconds 80
     def _send_inkit_frame_to_maya(self) -> None:
         """Maya's InkIt Sync window asked for the app's current frame."""
         try:
-            f = int(self.canvas.current_frame)
+            f = self.project.display_frame(int(self.canvas.current_frame))
         except Exception:
             return
-        self._send_maya_message(f"INKITFRAME {f}")
+        self._send_maya_message(f"INKITFRAME {f}")  # displayed number (first frame = 1)
 
     def _apply_maya_frame(self, maya_frame: int) -> None:
         if not bool(self._settings.get("maya_sync", False)):
             return
         if self.project.frame_count <= 0:
             return
-        inkit = int(maya_frame) - int(self._maya_offset) - int(self.project.start_frame)
+        # Maya frame M -> InkIt frame number N = M - offset -> 0-based index N - 1
+        inkit = int(maya_frame) - int(self._maya_offset) - FIRST_FRAME
         inkit = max(0, min(inkit, int(self.project.frame_count) - 1))
         # coalesce — Maya may send 60fps during drag/play, process at display rate
         self._maya_pending_frame = inkit
@@ -9601,8 +9491,7 @@ Start-Sleep -Milliseconds 80
 
     def _prompt_maya_offset(self) -> None:
         cur = int(self._maya_offset)
-        # suggest current Maya frame as zero mapping
-        start = int(self.project.start_frame)
+        start = FIRST_FRAME
         disp = self.project.display_frame(self.canvas.current_frame)
         hint = (f"Which Maya frame should equal InkIt frame {start} (the clip's first frame)?\n"
                 f"Current: Maya {cur + start} = InkIt {start}  (InkIt {disp} is Maya {cur + disp})")
@@ -9612,15 +9501,42 @@ Start-Sleep -Milliseconds 80
             if self._maya_server is not None:
                 self.statusBar().showMessage(f"Maya Sync ON  (port {self._maya_port}  offset {self._maya_offset})", 3000)
 
+    def _migrate_maya_offsets(self) -> None:
+        """One-time move of saved Maya offsets to 1-based InkIt frame numbers.
+
+        Old builds stored  Maya = index + offset  (InkIt counted from 0, or from
+        a user start frame S:  Maya = index + S + offset). Now  Maya = index + 1
+        + offset, so each saved offset becomes  old + S - 1  to keep the exact
+        same Maya frame for every clip frame. The old hard-coded default 10045
+        was never user-configured: it becomes 0 (InkIt 1 = Maya 1).
+        """
+        st = self._settings
+        if int(st.get("maya_offset_base", 0) or 0) == FIRST_FRAME:
+            return
+        starts_by_key = dict(st.get("start_frames", {}) or {})
+
+        def start_for(path: str) -> int:
+            try:
+                key = str(Path(path).resolve()).lower()
+            except Exception:
+                key = str(path).lower()
+            return int(starts_by_key.get(key, 0) or 0)
+
+        if "maya_offset" in st:
+            old = int(st.get("maya_offset") or 0)
+            st["maya_offset"] = 0 if old in (0, 10045) else old - FIRST_FRAME
+        st["maya_offsets"] = {
+            p: int(v) + start_for(p) - FIRST_FRAME for p, v in (st.get("maya_offsets", {}) or {}).items()
+        }
+        st.pop("start_frames", None)  # start numbers are gone: first frame is always 1
+        st["maya_offset_base"] = FIRST_FRAME
+
     def _load_maya_offset_for_path(self, path: str | None) -> None:
         if not path:
             return
         off = self._maya_offsets.get(str(path))
         if off is not None:
             self._maya_offset = int(off)
-        elif int(getattr(self.project, "start_frame", 0) or 0) != 0:
-            # Clip carries real frame numbers (e.g. 1001): Maya frame == InkIt frame
-            self._maya_offset = 0
 
     def _maybe_send_to_maya(self, inkit_frame: int) -> None:
         if not bool(self._settings.get("maya_sync", False)):
@@ -9631,7 +9547,8 @@ Start-Sleep -Milliseconds 80
             return
         try:
             import socket
-            maya_frame = int(inkit_frame) + int(self.project.start_frame) + int(self._maya_offset)
+            # InkIt frame number N (index + 1) -> Maya frame N + offset
+            maya_frame = self.project.display_frame(inkit_frame) + int(self._maya_offset)
             s = socket.socket()
             s.settimeout(0.015)
             s.connect(("127.0.0.1", int(self._maya_send_port)))
@@ -9651,7 +9568,7 @@ Start-Sleep -Milliseconds 80
             s = socket.socket()
             s.settimeout(0.015)
             s.connect(("127.0.0.1", int(self._maya_send_port)))
-            s.sendall(f"APPFRAME {int(inkit_frame) + int(self.project.start_frame)}\n".encode())
+            s.sendall(f"APPFRAME {self.project.display_frame(inkit_frame)}\n".encode())
             s.close()
         except Exception:
             self._maya_send_fail_until = time.time() + 1.0
@@ -10107,11 +10024,6 @@ Start-Sleep -Milliseconds 80
             if proj.fps_override:
                 self._apply_fps(float(proj.fps_override), remember=False)
             self._refresh_marks()
-            if "start_frame" in data:
-                self.project.start_frame = int(data.get("start_frame") or 0)
-                self._sync_start_box()
-                self._load_maya_offset_for_path(self.project.path)
-                self._update_time_label()
             self.project.scene_path = path
             self.project.user_saved = not is_autosave_name(path)
             self._settings["last_open_dir"] = str(Path(path).parent)

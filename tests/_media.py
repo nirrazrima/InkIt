@@ -49,11 +49,11 @@ def make_h264(path: Path, n: int = 300, fps: float = 24.0, gop: int = 250, bfram
     assert p.returncode == 0, "ffmpeg failed to write test clip"
 
 
-def make_sequence(folder: Path, stem: str = "shot", start: int = 1001, n: int = 12, ext: str = ".png") -> Path:
+def make_sequence(folder: Path, stem: str = "shot", start: int = 1001, n: int = 12, ext: str = ".png", content_offset: int = 0) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     first = None
     for k in range(n):
         f = folder / f"{stem}.{start + k:04d}{ext}"
-        cv2.imwrite(str(f), make_frame(k))
+        cv2.imwrite(str(f), make_frame(k + content_offset))
         first = first or f
     return first
