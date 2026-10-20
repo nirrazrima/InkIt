@@ -11,6 +11,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Must be set before cv2 is imported (OpenCV 4.x only enables EXR on request);
+# app.py does the same, but this file imports cv2 first.
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -368,14 +371,33 @@ def test_compare(w, tmp: Path, qapp) -> None:
     w._set_compare_mode("side")
     qapp.processEvents()
     w.canvas.repaint()
-    check(w.canvas._dst.width() < full.width() * 0.75, "side-by-side puts A in the left half")
+    # Geometry, not a width ratio: on a wide canvas (bigger window minimum on
+    # Windows / high DPI) A is height-bound and keeps its width in both modes.
+    cr = w.canvas.rect()
+    mid = cr.width() / 2.0
+    a_r, b_r = w.canvas._dst, w.canvas._compare_side_rect()
+    left = w.canvas._layout_rect()
+    a_fit = min(left.width() / 320.0, left.height() / 180.0)
+    check(a_r.left() >= -0.5 and a_r.right() <= mid + 0.5 and b_r.left() >= mid - 0.5 and b_r.right() <= cr.width() + 0.5
+          and abs(a_r.width() - 320.0 * a_fit) < 1.5,
+          f"side-by-side puts A in the left half, B in the right (canvas {cr.width()}x{cr.height()}, A {a_r.getRect()}, B {b_r.getRect()})")
     w.grab().save(str(shots / "compare_side.png"))
+    old_size = w.size()
+    w.resize(max(2400, w.width() * 2), w.height())  # very wide canvas: A is height-bound
+    qapp.processEvents()
+    w.canvas.repaint()
+    cr = w.canvas.rect()
+    check(w.canvas._dst.right() <= cr.width() / 2.0 + 0.5 and w.canvas._compare_side_rect().left() >= cr.width() / 2.0 - 0.5,
+          f"side-by-side halves hold on a wide canvas ({cr.width()}x{cr.height()})")
+    w.resize(old_size)
+    qapp.processEvents()
     # B only / Overlay: sample a pixel of the drawing-free area (A frame 31 encodes 30, B frame 31 encodes 40)
     def px():
         w.canvas.repaint()
         img = w.canvas.grab().toImage()
         d = w.canvas._dst
-        return img.pixelColor(int(d.x() + d.width() * 0.075), int(d.y() + d.height() * 0.04)).lightness()
+        dpr = img.devicePixelRatio()  # grab() is in device pixels on scaled displays
+        return img.pixelColor(int((d.x() + d.width() * 0.075) * dpr), int((d.y() + d.height() * 0.04) * dpr)).lightness()
     a_bits = (30 >> 1) & 1   # second block = bit 1 of the frame index (A=1)
     b_bits = (40 >> 1) & 1   # B frame 31 encodes 40 (B=0)
     w._set_compare_mode("bonly")
