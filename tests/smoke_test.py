@@ -92,90 +92,106 @@ def test_frame_accurate_seek(w, tmp: Path, qapp) -> None:
         check(got == idx, f"_show_frame({idx}) displays decoded frame {idx}")
 
 
-def test_start_frame(w, tmp: Path, qapp) -> None:
-    """Start frame: detection, click-to-type, drag-scrub, labels, scene + Maya mapping."""
+def test_first_frame_is_one(w, tmp: Path, qapp) -> None:
+    """No start-frame feature: every clip starts at 1; Maya maps N <-> N + offset both ways."""
     import socket
     import threading
-    from PySide6.QtCore import QPoint, Qt as _Qt
-    from PySide6.QtTest import QTest
 
-    check(app.detect_start_frame("sh010_anim.1001-1100.mov") == 1001, "detect 1001 from 'x.1001-1100.mov'")
-    check(app.detect_start_frame("sh010_fr6586.mp4") == 6586, "detect 6586 from 'x_fr6586.mp4'")
-    check(app.detect_start_frame("sh010_v003.mp4") is None, "no false start frame from a version number")
-
-    clip = tmp / "sh020_1001-1047.mp4"
+    check(not hasattr(w, "box_start") and "start_frame" not in w._actions, "no Start box / start-frame action")
+    check(not hasattr(w, "box_compare_start") and not hasattr(app, "detect_start_frame"), "no B start box, no filename detection")
+    clip = tmp / "sh020_1001-1047.mp4"  # numbers in the name are ignored
     make_clip(clip)
     w._open_video_path(str(clip))
-    check(w.project.start_frame == 1001, "start frame auto-detected on open (1001)")
-    check(w.box_start.value() == 1001, "start box shows 1001")
+    check(w.lbl_time.text() == "Frame 1 / 48", f"first frame shows as 1 ({w.lbl_time.text()})")
     w._show_frame(5)
-    check(w.lbl_time.text() == "Frame 1006 / 1048", f"counter honours start ({w.lbl_time.text()})")
+    check(w.lbl_time.text() == "Frame 6 / 48" and w.canvas.frame_overlay_text == "6", "index 5 shows as frame 6 (counter + HUD)")
+    check(app.format_time(0, 24.0) == "0:00:00", "timecode of the first frame is 0:00:00")
 
-    # click without drag -> inline editor; type 6586 + Enter
-    box = w.box_start
-    QTest.mouseClick(box, _Qt.MouseButton.LeftButton, pos=QPoint(40, 15))
-    qapp.processEvents()
-    check(box._edit.isVisible(), "click opens inline start-frame editor")
-    box._edit.selectAll()
-    QTest.keyClicks(box._edit, "6586")
-    QTest.keyClick(box._edit, _Qt.Key.Key_Return)
-    qapp.processEvents()
-    check(w.project.start_frame == 6586, f"typed start frame applied ({w.project.start_frame})")
-    check(w.lbl_time.text().startswith("Frame 6591"), "counter relabelled after typing")
+    # Legacy scene carrying "start_frame": loads, value ignored
+    data = w.project.to_json()
+    check("start_frame" not in data, "scenes no longer write start_frame")
+    data["start_frame"] = 1001
+    legacy = tmp / "legacy_start.inkit"
+    legacy.write_text(json.dumps(data), encoding="utf-8")
+    w._open_scene_path(str(legacy))
+    check(w.project.path == str(clip) and w.lbl_time.text().startswith("Frame 1 /"), "legacy start_frame ignored on load")
 
-    # click-drag scrub: +40 px -> +10 frames at 4 px/step
-    QTest.mousePress(box, _Qt.MouseButton.LeftButton, pos=QPoint(40, 15))
-    QTest.mouseMove(box, QPoint(60, 15))
-    QTest.mouseMove(box, QPoint(80, 15))
-    QTest.mouseRelease(box, _Qt.MouseButton.LeftButton, pos=QPoint(80, 15))
-    qapp.processEvents()
-    check(w.project.start_frame == 6596 and not box._edit.isVisible(), f"drag scrubs start frame (+10 -> {w.project.start_frame})")
-
-    # scene round-trip keeps it
-    scene = tmp / "sh020.inkit"
-    scene.write_text(json.dumps(w.project.to_json()), encoding="utf-8")
-    w._set_start_frame(1)
-    w._open_scene_path(str(scene))
-    check(w.project.start_frame == 6596, "start frame restored from scene")
-    old = json.loads(scene.read_text())
-    old.pop("start_frame")
-    w._settings["start_frames"] = {}
-    legacy = tmp / "legacy.inkit"
-    legacy.write_text(json.dumps(old), encoding="utf-8")
-    check(app.Project().start_frame == 0, "legacy default start frame is 0")
-
-    # Maya mapping: Maya frame N == InkIt frame N when offset 0
-    w._set_start_frame(1001)
+    # Maya mapping. Offset 0 (default): InkIt N = Maya N
     w._maya_offsets.pop(str(clip), None)
-    w._load_maya_offset_for_path(str(clip))
-    check(w._maya_offset == 0, "Maya offset defaults to 0 for numbered clips")
+    w._maya_offset = 0
     w._settings["maya_sync"] = True
-    w._apply_maya_frame(1010)
+    w._apply_maya_frame(1)
     w._process_maya_pending()
-    check(w.canvas.current_frame == 9 and w.lbl_time.text().startswith("Frame 1010"), "Maya 1010 -> InkIt frame 1010 (index 9)")
-    got: list[str] = []
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(4)
-    w._maya_send_port = srv.getsockname()[1]
-    w._maya_send_fail_until = 0
+    w._apply_maya_frame(10)
+    w._process_maya_pending()
+    check(w.canvas.current_frame == 9 and w.lbl_time.text().startswith("Frame 10 /"), "Maya 10 -> InkIt 10 (index 9), offset 0")
+    w._show_frame(3)
+    w._apply_maya_frame(1)
+    w._process_maya_pending()
+    check(w.canvas.current_frame == 0, "Maya 1 -> InkIt 1 (first frame)")
+    # Offset 1000 (e.g. Maya shot starts at 1001): Maya 1001 = InkIt 1
+    w._set_maya_offset(1000, save=False)
+    w._apply_maya_frame(1001)
+    w._process_maya_pending()
+    check(w.canvas.current_frame == 0, "offset 1000: Maya 1001 -> InkIt 1")
+    w._apply_maya_frame(1020)
+    w._process_maya_pending()
+    check(w.canvas.current_frame == 19, "offset 1000: Maya 1020 -> InkIt 20")
 
-    def serve():
-        srv.settimeout(2)
-        for _ in range(2):
-            try:
-                c, _a = srv.accept()
-                got.append(c.recv(100).decode().strip())
-                c.close()
-            except Exception:
-                break
-    t = threading.Thread(target=serve)
-    t.start()
-    w._show_frame(20)
-    t.join()
-    srv.close()
+    def capture(action, n):
+        got: list[str] = []
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        w._maya_send_port = srv.getsockname()[1]
+        w._maya_send_fail_until = 0
+
+        def serve():
+            srv.settimeout(2)
+            for _ in range(n):
+                try:
+                    c, _a = srv.accept()
+                    got.append(c.recv(100).decode().strip())
+                    c.close()
+                except Exception:
+                    break
+        t = threading.Thread(target=serve)
+        t.start()
+        action()
+        t.join()
+        srv.close()
+        return got
+    got = capture(lambda: w._show_frame(4), 2)
+    check(got == ["FRAME 1005", "APPFRAME 5"], f"InkIt 5 sends Maya 1005 and shows 5 in Maya's InkIt box ({got})")
+    w._set_maya_offset(0, save=False)
+    got = capture(lambda: w._show_frame(0), 2)
+    check(got == ["FRAME 1", "APPFRAME 1"], f"offset 0: InkIt 1 sends Maya 1 ({got})")
+    sent: list[str] = []
+    orig = w._send_maya_message
+    w._send_maya_message = lambda m: sent.append(m)
+    w._show_frame(6)
+    w._send_inkit_frame_to_maya()
+    w._send_maya_message = orig
+    check(sent == ["INKITFRAME 7"], f"CURFRAME? reply uses the displayed number ({sent})")
     w._settings["maya_sync"] = False
-    check("FRAME 1021" in got and "APPFRAME 1021" in got, f"InkIt 1021 sends Maya FRAME/APPFRAME 1021 ({got})")
+
+    # Saved offsets from older builds keep the exact same Maya frame
+    st = w._settings
+    keep = dict(st)
+    try:
+        cp = str(tmp / "old.mp4")
+        st.pop("maya_offset_base", None)
+        st["maya_offset"] = 10045
+        st["maya_offsets"] = {cp: 1000, str(clip): 0}
+        st["start_frames"] = {w._notes_key(str(clip)): 1001}
+        w._migrate_maya_offsets()
+        check(st["maya_offset"] == 0, "old default 10045 offset becomes 0 (InkIt 1 = Maya 1)")
+        check(st["maya_offsets"][cp] == 999, "old per-clip offset 1000 (Maya 1000 = old 0) -> 999 (Maya 1000 = InkIt 1)")
+        check(st["maya_offsets"][str(clip)] == 1000, "old start-1001 clip offset 0 -> 1000 (Maya 1001 = InkIt 1)")
+        check("start_frames" not in st and st["maya_offset_base"] == 1, "start_frames dropped, migration recorded")
+    finally:
+        st.clear()
+        st.update(keep)
 
 
 def test_text_notes(w, tmp: Path, qapp) -> None:
@@ -184,7 +200,6 @@ def test_text_notes(w, tmp: Path, qapp) -> None:
     clip = tmp / "sh030_1001-1047.mp4"
     make_clip(clip)
     w._open_video_path(str(clip))
-    w._set_start_frame(1001)
     w._show_frame(4)
 
     from PySide6.QtCore import QPoint, Qt as _Qt
@@ -199,17 +214,17 @@ def test_text_notes(w, tmp: Path, qapp) -> None:
         box = dlg.sp_end  # click-to-type the end frame
         QTest.mouseClick(box, _Qt.MouseButton.LeftButton, pos=QPoint(40, 15))
         box._edit.selectAll()
-        QTest.keyClicks(box._edit, "1012")
+        QTest.keyClicks(box._edit, "12")
         QTest.keyClick(box._edit, _Qt.Key.Key_Return)
         dlg.accept()
     QTimer.singleShot(50, fill)
     w.add_text_note()
-    check(seen.get("defaults") == (1005, 1005), f"note dialog defaults From/To to current frame ({seen.get('defaults')})")
+    check(seen.get("defaults") == (5, 5), f"note dialog defaults From/To to current frame ({seen.get('defaults')})")
     n = w.project.text_notes
-    check(len(n) == 1 and n[0]["start"] == 4 and n[0]["end"] == 11, f"range note stored 0-based (1005-1012 -> {n})")
+    check(len(n) == 1 and n[0]["start"] == 4 and n[0]["end"] == 11, f"range note stored 0-based (5-12 -> {n})")
     w.project.text_notes.append({"start": 30, "end": 30, "text": "arc is floaty"})
     w._notes_changed()
-    check(w.notes_list.count() == 2 and w.notes_list.item(0).text().startswith("1005–1012"), "sidebar lists notes with display frames")
+    check(w.notes_list.count() == 2 and w.notes_list.item(0).text().startswith("5–12"), "sidebar lists notes with display frames")
     def move():
         dlg = qapp.activeModalWidget()
         box = dlg.sp_start  # drag-scrub From +8 frames (4 px/step); To follows
@@ -221,7 +236,7 @@ def test_text_notes(w, tmp: Path, qapp) -> None:
         dlg.accept()
     QTimer.singleShot(50, move)
     w._edit_text_note(1)
-    check(seen.get("edit") == (1039, 1039) and w.project.text_notes[1]["start"] == 38, f"editing a note changes its frames ({seen.get('edit')})")
+    check(seen.get("edit") == (39, 39) and w.project.text_notes[1]["start"] == 38, f"editing a note changes its frames ({seen.get('edit')})")
     w.project.text_notes[1].update({"start": 30, "end": 30})
     w._notes_changed()
     w._notes_jump(w.notes_list.item(1))
@@ -237,18 +252,17 @@ def test_text_notes(w, tmp: Path, qapp) -> None:
     check(len(w.project.text_notes) == 2, "typed notes restored from scene")
     legacy = json.loads(scene.read_text())
     legacy.pop("text_notes")
-    legacy.pop("start_frame")
     lp = tmp / "legacy_notes.inkit"
     lp.write_text(json.dumps(legacy), encoding="utf-8")
     pr = app.Project()
     pr.load_json(legacy)
-    check(pr.text_notes == [] and pr.start_frame == 0 and pr.annotated_frames() == [20], "legacy scene (no notes / start) loads")
+    check(pr.text_notes == [] and pr.display_frame(0) == 1 and pr.annotated_frames() == [20], "legacy scene (no notes / start) loads")
 
     out = w.export_review_sheet(str(tmp / "review.html"))
     html_txt = Path(out).read_text(encoding="utf-8")
     rows = list(__import__("csv").reader(open(tmp / "review.csv", encoding="utf-8-sig")))
     check(rows[0][:3] == ["shot", "frame_start", "frame_end"] and len(rows) == 4, f"review CSV has header + 3 rows ({len(rows)})")
-    check(rows[1][1:3] == ["1005", "1012"] and rows[2][1] == "1021" and rows[2][5] == "yes", "CSV uses display frames, drawing-only row included")
+    check(rows[1][1:3] == ["5", "12"] and rows[2][1] == "21" and rows[2][5] == "yes", "CSV uses display frames, drawing-only row included")
     check(html_txt.count("data:image/jpeg;base64,") == 3 and "arc is floaty" in html_txt, "HTML sheet embeds 3 thumbnails")
 
 
@@ -260,12 +274,11 @@ def test_sequences_fps_frames(w, tmp: Path, qapp) -> None:
     pat = app.sequence_pattern_for(first)
     check(pat is not None and pat.endswith("sh040_anim.####.png"), f"sequence pattern detected ({pat})")
     check(app.sequence_in_folder(seq_dir) == pat, "dropping the folder finds the sequence")
-    w._settings.setdefault("start_frames", {}).pop(w._notes_key(pat), None)
     w._settings.setdefault("fps_overrides", {}).pop(w._notes_key(pat), None)
     w._set_queue([pat])
     w._queue_open(w.queue_paths.index(pat))
     check(w.reader.is_sequence and w.project.frame_count == 12, f"sequence opened as 12-frame clip ({w.project.frame_count})")
-    check(w.project.start_frame == 1001 and w.lbl_time.text() == "Frame 1001 / 1012", f"start frame from sequence numbering ({w.lbl_time.text()})")
+    check(w.lbl_time.text() == "Frame 1 / 12", f"sequence numbered 1001+ still shows its first frame as 1 ({w.lbl_time.text()})")
     ids = [block_id(w.reader.frame(i)) for i in range(12)]
     check(ids == [0, 1, 2, 3, 3, 5, 6, 7, 8, 9, 10, 11], f"sequence frames in order, gap holds previous ({ids})")
 
@@ -281,8 +294,8 @@ def test_sequences_fps_frames(w, tmp: Path, qapp) -> None:
 
     out = w.export_annotated_frames(str(tmp / "frames"))
     names = sorted(Path(x).name for x in out)
-    check(names == ["sh040_anim.1003.png", "sh040_anim.1008.png", "sh040_anim_contact_sheet.png"], f"annotated frames exported with display numbers ({names})")
-    png = cv2.imread(str(tmp / "frames" / "sh040_anim.1003.png"))
+    check(names == ["sh040_anim.0003.png", "sh040_anim.0008.png", "sh040_anim_contact_sheet.png"], f"annotated frames exported with display numbers ({names})")
+    png = cv2.imread(str(tmp / "frames" / "sh040_anim.0003.png"))
     check(png is not None and int(png[90, 160, 2]) > 200 and int(png[90, 160, 1]) < 80, "exported PNG has the drawing burned in")
     sheet = cv2.imread(str(tmp / "frames" / "sh040_anim_contact_sheet.png"))
     check(sheet is not None and sheet.shape[1] > 900, f"contact sheet written ({None if sheet is None else sheet.shape})")
@@ -325,7 +338,7 @@ def test_sequences_fps_frames(w, tmp: Path, qapp) -> None:
     if okexr:
         r = app.VideoReader()
         r.open(str(exr_dir / "plate.####.exr"))
-        check(r.seq_start == 1 and [block_id(r.frame(i)) for i in range(3)] == [0, 1, 2], "EXR sequence decodes (linear -> sRGB)")
+        check([block_id(r.frame(i)) for i in range(3)] == [0, 1, 2], "EXR sequence decodes (linear -> sRGB)")
         r.close()
     else:
         print("skip  EXR (this OpenCV build has no OpenEXR writer)")
@@ -336,17 +349,14 @@ def test_compare(w, tmp: Path, qapp) -> None:
     a = tmp / "sh050_v001.1001-1060.mp4"
     make_h264(a, n=60, gop=250)
     bdir = tmp / "b"
-    make_sequence(bdir, "sh050_v002", start=1011, n=40)
-    w._settings.get("start_frames", {}).pop(w._notes_key(str(a)), None)
+    make_sequence(bdir, "sh050_v002", start=1011, n=40, content_offset=10)  # B frame k encodes k+10
     w._open_video_path(str(a))
-    check(w.project.start_frame == 1001, "A start 1001")
     w._settings["compare_mode"] = "wipe"
     check(w.load_compare_clip(str(bdir / "sh050_v002.1020.png")), "load B from any sequence frame")
-    check(w.compare_start == 1011 and w.canvas.compare_mode == "wipe", "B start 1011 detected, wipe mode on")
-    w._show_frame(25)  # A frame 1026 -> B frame 1026 -> B index 15
-    check(block_id(w.compare_reader.frame(w.compare_index_for(25))) == 15, "B locked to A by frame number (1026)")
-    w._show_frame(0)   # A 1001 is before B starts: B holds its first frame
-    check(w.compare_index_for(0) == 0, "B clamps before its first frame")
+    check(w.canvas.compare_mode == "wipe", "wipe mode on")
+    w._show_frame(25)  # A frame 26 -> B frame 26 (both clips start at 1)
+    check(block_id(w.compare_reader.frame(w.compare_index_for(25))) == 35, "B locked to A frame for frame (26 = 26)")
+    check(w.compare_index_for(0) == 0 and w.compare_index_for(59) == 39, "B 1 = A 1; B holds its last frame past its end")
     w.project.strokes_at(30).append(app.Stroke(color="#ffcc00", base_width=12.0, points=[app.Point(0.05, 0.5, 1.0), app.Point(0.95, 0.5, 1.0)]))
     w._show_frame(30)
     qapp.processEvents()
@@ -360,14 +370,14 @@ def test_compare(w, tmp: Path, qapp) -> None:
     w.canvas.repaint()
     check(w.canvas._dst.width() < full.width() * 0.75, "side-by-side puts A in the left half")
     w.grab().save(str(shots / "compare_side.png"))
-    # B only / Overlay: sample a pixel of the drawing-free area (A frame 30 vs B frame 20)
+    # B only / Overlay: sample a pixel of the drawing-free area (A frame 31 encodes 30, B frame 31 encodes 40)
     def px():
         w.canvas.repaint()
         img = w.canvas.grab().toImage()
         d = w.canvas._dst
         return img.pixelColor(int(d.x() + d.width() * 0.075), int(d.y() + d.height() * 0.04)).lightness()
     a_bits = (30 >> 1) & 1   # second block = bit 1 of the frame index (A=1)
-    b_bits = (20 >> 1) & 1   # (B=0)
+    b_bits = (40 >> 1) & 1   # B frame 31 encodes 40 (B=0)
     w._set_compare_mode("bonly")
     qapp.processEvents()
     v_b = px()
@@ -391,8 +401,8 @@ def test_compare(w, tmp: Path, qapp) -> None:
     check(w.canvas.compare_image is None and not w._compare_bar.isVisible(), "close compare")
 
 
-def test_value_controls_and_start_memory(w, tmp: Path, qapp) -> None:
-    """Value-only BoxSlider (no track): click-to-type + drag; start frame remembered globally."""
+def test_value_controls(w, tmp: Path, qapp) -> None:
+    """Value-only BoxSlider (no track): click-to-type + drag."""
     from PySide6.QtCore import QPoint, Qt as _Qt
     from PySide6.QtTest import QTest
     sl = w.sl_pen_op
@@ -412,20 +422,6 @@ def test_value_controls_and_start_memory(w, tmp: Path, qapp) -> None:
     QTest.mouseRelease(sl, _Qt.MouseButton.LeftButton, pos=QPoint(5, y))
     check(sl.value() == 63 and not sl._edit.isVisible(), f"drag changes value relatively (-15px -> {sl.value()})")
 
-    # Start frame: last user value is used for clips without detected/saved start
-    w._open_video_path(str(tmp / "shot_test.mp4"))
-    w._set_start_frame(6586)
-    check(int(w._qsettings().value("start_frame/last", 0)) == 6586, "last start frame persisted in QSettings")
-    plain = tmp / "plainclip.mp4"
-    make_clip(plain)
-    w._settings.get("start_frames", {}).pop(w._notes_key(str(plain)), None)
-    w._open_video_path(str(plain))
-    check(w.project.start_frame == 6586 and w.box_start.value() == 6586, "new clip without a start uses the last value (6586)")
-    numbered = tmp / "sh060_1001-1047.mp4"
-    make_clip(numbered)
-    w._settings.get("start_frames", {}).pop(w._notes_key(str(numbered)), None)
-    w._open_video_path(str(numbered))
-    check(w.project.start_frame == 1001, "auto-detected start still wins over the last value")
 
 
 def test_version(w, tmp: Path, qapp) -> None:
@@ -474,7 +470,7 @@ def test_version(w, tmp: Path, qapp) -> None:
           and "'FileVersion', '%d.%d.%d.%d'" % V.VERSION_TUPLE in res, "spec builds exe version resource from version.py")
 
 
-FEATURE_TESTS = [test_version, test_value_controls_and_start_memory, test_frame_accurate_seek, test_start_frame, test_text_notes, test_sequences_fps_frames, test_compare]
+FEATURE_TESTS = [test_version, test_value_controls, test_frame_accurate_seek, test_first_frame_is_one, test_text_notes, test_sequences_fps_frames, test_compare]
 
 
 def main() -> int:
