@@ -403,7 +403,13 @@ def test_compare(w, tmp: Path, qapp) -> None:
     w._set_compare_mode("bonly")
     qapp.processEvents()
     v_b = px()
-    check(abs(w.canvas._dst.width() - full.width()) < 2 and (v_b > 200) == bool(b_bits), f"B only shows B in A's frame ({v_b})")
+    # Expected full view = A letterboxed into the whole canvas, computed now (the
+    # window may not return to its old size after the wide-canvas resize).
+    cr = w.canvas.rect()
+    f_fit = min(cr.width() / 320.0, cr.height() / 180.0)
+    d = w.canvas._dst
+    check(abs(d.width() - 320.0 * f_fit) < 2 and (v_b > 200) == bool(b_bits),
+          f"B only shows B in A's frame (px {v_b}, A {d.getRect()}, canvas {cr.width()}x{cr.height()})")
     w._set_compare_mode("overlay")
     w.sl_b_op.setValue(0)
     v0 = px()
@@ -418,7 +424,8 @@ def test_compare(w, tmp: Path, qapp) -> None:
     w._set_compare_mode("off")
     qapp.processEvents()
     w.canvas.repaint()
-    check(abs(w.canvas._dst.width() - full.width()) < 2, "A only restores the full view")
+    cr = w.canvas.rect()
+    check(abs(w.canvas._dst.width() - 320.0 * min(cr.width() / 320.0, cr.height() / 180.0)) < 2, "A only restores the full view")
     w.close_compare()
     check(w.canvas.compare_image is None and not w._compare_bar.isVisible(), "close compare")
 
