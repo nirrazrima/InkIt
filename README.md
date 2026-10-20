@@ -1,4 +1,6 @@
-# InkIt
+# InkIt (Beta)
+
+> **Current version: `0.9.0-beta.1`** — public beta. Please report issues and feedback.
 
 **InkIt** is a local, video and image annotation and animation-review player for Windows. It lets you draw directly on top of video frames — frame by frame — the way animators annotate dailies, boards, and animatics. It is fully self-contained: one executable, no Python, FFmpeg, or Qt install required.
 
@@ -134,6 +136,16 @@ CI: `.github/workflows/build.yml` (currently staged as `ci/build.yml` — move i
 git tag v1.2.0
 git push origin v1.2.0
 ```
+
+## Versioning
+
+InkIt uses [Semantic Versioning](https://semver.org) with beta pre-releases (`0.x.y-beta.N`). The **only** place the version lives is `version.py` (`__version__`):
+
+- the window title and **Help ▸ About** show it as `InkIt Beta 0.9.0-beta.1`;
+- `InkIt.spec` builds the Windows exe version resource from it (Properties ▸ Details: Product name `InkIt Beta`, Product version `0.9.0-beta.1`, File version `0.9.0.1` — the last number is the beta number);
+- release tags should match it, e.g. `git tag v0.9.0-beta.1`.
+
+To cut the next beta, bump `__version__` in `version.py` (e.g. `0.9.0-beta.2`), rebuild, and tag.
 
 ## Notes
 

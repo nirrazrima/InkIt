@@ -15,8 +15,42 @@ import shutil
 from pathlib import Path
 
 import imageio_ffmpeg
+try:  # needs pefile, which PyInstaller only installs on Windows
+    from PyInstaller.utils.win32.versioninfo import (
+        FixedFileInfo, StringFileInfo, StringStruct, StringTable,
+        VarFileInfo, VarStruct, VSVersionInfo,
+    )
+except ImportError:
+    VSVersionInfo = None
 
 ROOT = Path(SPECPATH).resolve()
+
+# Version comes ONLY from version.py
+import sys as _sys
+_sys.path.insert(0, str(ROOT))
+import version as V  # noqa: E402
+
+_ver4 = V.VERSION_TUPLE                      # e.g. (0, 9, 0, 1)
+_ver4_txt = ".".join(str(x) for x in _ver4)   # FileVersion "0.9.0.1"
+_product = "InkIt Beta" if V.IS_BETA else "InkIt"
+VERSION_RESOURCE = None if VSVersionInfo is None else VSVersionInfo(
+    ffi=FixedFileInfo(filevers=_ver4, prodvers=_ver4, mask=0x3F,
+                      flags=0x2 if V.IS_BETA else 0x0,  # VS_FF_PRERELEASE
+                      OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+    kids=[
+        StringFileInfo([StringTable("040904B0", [
+            StringStruct("CompanyName", "InkIt"),
+            StringStruct("FileDescription", f"InkIt {V.display_version()} — video annotation & animation review"),
+            StringStruct("FileVersion", _ver4_txt),
+            StringStruct("InternalName", "InkIt"),
+            StringStruct("OriginalFilename", "InkIt.exe"),
+            StringStruct("ProductName", _product),
+            StringStruct("ProductVersion", V.__version__),
+            StringStruct("LegalCopyright", "© Amir Zarrin"),
+        ])]),
+        VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
+    ],
+)
 BUILD_TMP = ROOT / "build" / "_bundle"
 BUILD_TMP.mkdir(parents=True, exist_ok=True)
 
@@ -35,6 +69,7 @@ datas = [
     (str(ROOT / "maya_inkit_sync.py"), "."),
     (str(ROOT / "inkit_bootstrap.py"), "."),
 ]
+# version.py is imported by app.py, so PyInstaller bundles it as a module.
 binaries = [(str(_ff_dst), ".")]
 
 a = Analysis(
@@ -68,4 +103,5 @@ exe = EXE(
     runtime_tmpdir=None,
     console=False,
     icon=str(ROOT / "icon.ico"),
+    version=VERSION_RESOURCE,  # Windows Properties ▸ Details (ignored on other OSes)
 )

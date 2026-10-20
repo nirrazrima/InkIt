@@ -101,6 +101,17 @@ if "__compiled__" in globals():
         except OSError:
             pass
 
+try:
+    from version import __version__, display_version, title_base
+except ImportError:  # running app.py without version.py next to it
+    __version__ = "0.0.0"
+
+    def display_version() -> str:
+        return __version__
+
+    def title_base() -> str:
+        return f"InkIt {__version__}"
+
 # OpenEXR decoding in OpenCV 4.x is opt-in and must be enabled before import.
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
@@ -5999,7 +6010,7 @@ class MainWindow(QMainWindow):
     """
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("InkIt")
+        self.setWindowTitle(title_base())
         self.resize(1280, 820)
         self.project = Project()
         self.reader = VideoReader()
@@ -6527,6 +6538,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_compare_bar())
         layout.addWidget(play_wrap)
 
+    def about_text(self) -> str:
+        return (
+            f"<h3>InkIt {html.escape(display_version())}</h3>"
+            f"<p>Version {html.escape(__version__)}"
+            + (" — <b>Beta</b>: please report issues and feedback." if "beta" in __version__ else "")
+            + "</p><p>Frame-accurate video / image annotation and animation review.</p>"
+            "<p><a href='https://github.com/nirrazrima/InkIt'>github.com/nirrazrima/InkIt</a></p>"
+        )
+
+    def show_about(self) -> None:
+        QMessageBox.about(self, f"About InkIt {display_version()}", self.about_text())
+
     def _act(self, key: str, slot) -> QAction:
         a = QAction(ACTION_LABELS.get(key, key), self)
         a.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -6604,6 +6627,9 @@ class MainWindow(QMainWindow):
         edit.addSeparator()
         edit.addAction(self._act("add_note", self.add_text_note))
         edit.addSeparator()
+
+        help_m = m.addMenu("Help")
+        help_m.addAction("About InkIt…", self.show_about)
 
         view = m.addMenu("View")
         view.addAction(self._act("toggle_notes", self._hotkey_hide))
@@ -7074,7 +7100,7 @@ class MainWindow(QMainWindow):
         self._show_frame(0)
         self._refresh_marks()
         self._update_meta_label()
-        self.setWindowTitle(f"InkIt — {Path(path).name}")
+        self.setWindowTitle(f"{title_base()} — {Path(path).name}")
         self._load_maya_offset_for_path(path)
 
     def _update_meta_label(self) -> None:
@@ -7992,7 +8018,7 @@ class MainWindow(QMainWindow):
         self.project.scene_path = scene_path
         self.project.user_saved = not is_autosave_name(scene_path)
         self._push_recent("recent_open", scene_path)
-        self.setWindowTitle(f"InkIt — Drawing board  [{Path(scene_path).name}]")
+        self.setWindowTitle(f"{title_base()} — Drawing board  [{Path(scene_path).name}]")
         return True
 
     def _onion_depth_changed(self) -> None:
@@ -10091,7 +10117,7 @@ Start-Sleep -Milliseconds 80
             self._settings["last_open_dir"] = str(Path(path).parent)
             self._push_recent("recent_open", path)
             self._refresh_marks()
-            self.setWindowTitle(f"InkIt — {Path(proj.path).name}  [{Path(path).name}]")
+            self.setWindowTitle(f"{title_base()} — {Path(proj.path).name}  [{Path(path).name}]")
 
     # -----------------------------------------------------------------------
     # Audio Engine & Playback Synchronization
@@ -10475,6 +10501,7 @@ def main() -> None:
     """Application main entry point."""
     app = QApplication(sys.argv)
     app.setApplicationName("InkIt")
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
 
     behavior = _resolve_open_behavior()

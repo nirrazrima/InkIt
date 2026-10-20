@@ -428,7 +428,53 @@ def test_value_controls_and_start_memory(w, tmp: Path, qapp) -> None:
     check(w.project.start_frame == 1001, "auto-detected start still wins over the last value")
 
 
-FEATURE_TESTS = [test_value_controls_and_start_memory, test_frame_accurate_seek, test_start_frame, test_text_notes, test_sequences_fps_frames, test_compare]
+def test_version(w, tmp: Path, qapp) -> None:
+    """Single version source: semver beta, window title, About text, exe resource."""
+    import re
+    import version as V
+    check(re.match(r"^\d+\.\d+\.\d+-beta\.\d+$", V.__version__) is not None, f"semantic beta version ({V.__version__})")
+    check(app.__version__ == V.__version__, "app.py reads version.py")
+    w._open_video_path(str(tmp / "shot_test.mp4"))
+    t = w.windowTitle()
+    check(t.startswith(f"InkIt Beta {V.__version__}"), f"window title shows Beta + version ({t})")
+    a = w.about_text()
+    check("Beta" in a and V.__version__ in a, "About shows Beta + version")
+    try:
+        import PyInstaller.utils.win32.versioninfo  # noqa: F401  (real classes on Windows)
+    except ImportError:
+        # Off Windows the module needs win32api: stand in with recording stubs
+        import types
+        stub = types.ModuleType("PyInstaller.utils.win32.versioninfo")
+
+        def _mk(name):
+            class _S:
+                def __init__(self, *a, **k):
+                    self.a, self.k = a, k
+
+                def __repr__(self):
+                    return f"{name}({', '.join(map(repr, self.a))}{', ' if self.a and self.k else ''}{', '.join(f'{k}={v!r}' for k, v in self.k.items())})"
+            return _S
+        for n in ("FixedFileInfo", "StringFileInfo", "StringTable", "VarFileInfo", "VarStruct", "VSVersionInfo"):
+            setattr(stub, n, _mk(n))
+
+        class StringStruct:
+            def __init__(self, k, v):
+                self.kv = (k, v)
+
+            def __repr__(self):
+                return repr(self.kv)
+        stub.StringStruct = StringStruct
+        sys.modules["PyInstaller.utils.win32.versioninfo"] = stub
+    ns: dict = {"SPECPATH": str(ROOT), "__file__": str(ROOT / "InkIt.spec")}
+    src = (ROOT / "InkIt.spec").read_text(encoding="utf-8")
+    head = src.split("datas = [")[0]  # imports + version resource only (no Analysis)
+    exec(compile(head, "InkIt.spec", "exec"), ns)
+    res = str(ns["VERSION_RESOURCE"])
+    check(f"'ProductVersion', '{V.__version__}'" in res and "'ProductName', 'InkIt Beta'" in res
+          and "'FileVersion', '%d.%d.%d.%d'" % V.VERSION_TUPLE in res, "spec builds exe version resource from version.py")
+
+
+FEATURE_TESTS = [test_version, test_value_controls_and_start_memory, test_frame_accurate_seek, test_start_frame, test_text_notes, test_sequences_fps_frames, test_compare]
 
 
 def main() -> int:
