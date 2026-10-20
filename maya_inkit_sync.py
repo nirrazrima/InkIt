@@ -389,13 +389,14 @@ def _apply_link(*a):
         except:
             pass
     _update_status_bar()
+    _inkit_release_focus()
 
 def _update_status_bar(*_):
     """Small status bar: live dot + the exact Maya/InkIt pair being connected."""
     try:
         on = bool(globals().get("inkit_maya_sync_enabled", False))
         dot = "● Live" if on else "○ Off"
-        mv, iv = 0, 0
+        mv, iv = 0, 1
         try:
             mv = int(cmds.intField("inkit_mayaField", q=True, value=True))
         except:
@@ -667,6 +668,187 @@ globals().setdefault("_inkit_offset", 0)
 globals().setdefault("_inkit_field_guard", False)
 globals().setdefault("_inkit_apply_after_frame", False)
 
+# --- InkIt focus guard begin ---
+# Keeps the panel from stealing keyboard focus / Maya hotkeys (floating window
+# or docked workspaceControl; PySide2 for Maya 2022-2024, PySide6 for 2025+).
+# Pure Qt so tests can exercise it without Maya.
+def _inkit_qt():
+    for core, wid, gui, shib in (("PySide6.QtCore", "PySide6.QtWidgets", "PySide6.QtGui", "shiboken6"),
+                                 ("PySide2.QtCore", "PySide2.QtWidgets", "PySide2.QtGui", "shiboken2")):
+        try:
+            import importlib
+            return (importlib.import_module(core), importlib.import_module(wid),
+                    importlib.import_module(gui), importlib.import_module(shib))
+        except Exception:
+            continue
+    return None
+
+
+def _inkit_make_focus_guard(QtCore, QtWidgets, QtGui, maya_main_getter):
+    """Returns (FocusGuard class instance factory). maya_main_getter() -> QWidget
+    that should receive keys/focus (Maya main window)."""
+    Qt = QtCore.Qt
+    _ev = QtCore.QEvent
+    TEXT_TYPES = (QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox)
+
+    def is_text(w):
+        return isinstance(w, TEXT_TYPES)
+
+    class FocusGuard(QtCore.QObject):
+        def __init__(self, root):
+            super(FocusGuard, self).__init__(root)
+            self.root = root
+            self.forwarded = 0
+            self.refresh()
+
+        def owns(self, w):
+            while w is not None:
+                if w is self.root:
+                    return True
+                w = w.parentWidget()
+            return False
+
+        def refresh(self):
+            """(Re)apply focus policies + filter to root and every child."""
+            r = self.root
+            try:
+                r.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            except Exception:
+                pass
+            for w in [r] + r.findChildren(QtWidgets.QWidget):
+                if is_text(w):
+                    w.setFocusPolicy(Qt.ClickFocus)
+                else:
+                    w.setFocusPolicy(Qt.NoFocus)
+                w.removeEventFilter(self)
+                w.installEventFilter(self)
+            self.clear_field_focus(give_back=False)
+
+        def editing_field(self):
+            fw = QtWidgets.QApplication.focusWidget()
+            if fw is not None and self.owns(fw):
+                # spin boxes delegate focus to their inner line edit
+                p = fw
+                while p is not None and p is not self.root:
+                    if is_text(p):
+                        return p
+                    p = p.parentWidget()
+            return None
+
+        def give_back(self):
+            m = maya_main_getter()
+            if m is None:
+                return
+            try:
+                m.activateWindow()
+            except Exception:
+                pass
+            m.setFocus(Qt.OtherFocusReason)
+
+        def clear_field_focus(self, give_back=True):
+            fw = QtWidgets.QApplication.focusWidget()
+            if fw is not None and self.owns(fw):
+                fw.clearFocus()
+            if give_back:
+                self.give_back()
+
+        def forward(self, event):
+            m = maya_main_getter()
+            if m is None:
+                return False
+            target = m.focusWidget() or m
+            if self.owns(target):
+                target = m
+            ke = QtGui.QKeyEvent(event.type(), event.key(), event.modifiers(), event.text(),
+                                 event.isAutoRepeat(), event.count())
+            self.give_back()
+            QtWidgets.QApplication.postEvent(target, ke)
+            self.forwarded += 1
+            return True
+
+        def eventFilter(self, obj, event):
+            t = event.type()
+            if t in (_ev.KeyPress, _ev.KeyRelease, _ev.ShortcutOverride):
+                field = self.editing_field()
+                if field is not None:
+                    if t == _ev.KeyPress and event.key() == Qt.Key_Escape:
+                        self.clear_field_focus()
+                        return True
+                    if t == _ev.KeyPress and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                        # let the field commit (changeCommand), then hand back
+                        QtCore.QTimer.singleShot(0, self.clear_field_focus)
+                    return False      # typing into a field: keep it here
+                if t == _ev.ShortcutOverride:
+                    return False
+                return self.forward(event)  # not editing: it's a Maya hotkey
+            if t == _ev.MouseButtonRelease and not is_text(obj):
+                QtCore.QTimer.singleShot(0, lambda: None if self.editing_field() else self.give_back())
+            if t == _ev.ChildAdded:
+                QtCore.QTimer.singleShot(0, self.refresh_children)
+            return False
+
+        def refresh_children(self):
+            for w in self.root.findChildren(QtWidgets.QWidget):
+                if is_text(w):
+                    w.setFocusPolicy(Qt.ClickFocus)
+                elif w.focusPolicy() != Qt.NoFocus:
+                    w.setFocusPolicy(Qt.NoFocus)
+                w.removeEventFilter(self)
+                w.installEventFilter(self)
+
+    return FocusGuard
+# --- InkIt focus guard end ---
+
+
+def _inkit_install_focus_guard():
+    """Find the panel's Qt widget (docked workspaceControl first, else the
+    window) and install the guard. Safe no-op if anything is missing."""
+    try:
+        qt = _inkit_qt()
+        if not qt:
+            return None
+        QtCore, QtWidgets, QtGui, shib = qt
+        import maya.OpenMayaUI as omui
+
+        def maya_main():
+            p = omui.MQtUtil.mainWindow()
+            return shib.wrapInstance(int(p), QtWidgets.QWidget) if p else None
+
+        ptr = None
+        for name in ("inkitSyncWindowWorkspaceControl", "inkitSyncWindow"):
+            try:
+                if cmds.workspaceControl(name, exists=True):
+                    ptr = omui.MQtUtil.findControl(name)
+            except Exception:
+                pass
+            if not ptr:
+                ptr = omui.MQtUtil.findWindow(name)
+            if ptr:
+                break
+        if not ptr:
+            return None
+        root = shib.wrapInstance(int(ptr), QtWidgets.QWidget)
+        old = globals().get("_inkit_focus_guard")
+        if old is not None:
+            try: old.deleteLater()
+            except Exception: pass
+        guard = _inkit_make_focus_guard(QtCore, QtWidgets, QtGui, maya_main)(root)
+        globals()["_inkit_focus_guard"] = guard
+        QtCore.QTimer.singleShot(0, guard.clear_field_focus)  # nothing focused on open
+        return guard
+    except Exception as e:
+        print(f"[InkIt] focus guard not installed: {e}")
+        return None
+
+
+def _inkit_release_focus(*_):
+    g = globals().get("_inkit_focus_guard")
+    if g is not None:
+        try:
+            g.clear_field_focus()
+        except Exception:
+            pass
+
 # ——— UI ———
 # silent install mode (INKIT_SILENT_INSTALL=1): only places the shelf button
 # live via _ensure_active_shelf_button(); no window, no sync, no servers.
@@ -716,7 +898,7 @@ if not _inkit_silent_install:
 
     # small status bar: which frame numbers are being connected
     cmds.rowLayout("inkit_statusRow", numberOfColumns=1, columnAttach=[(1, "both", 10)])
-    cmds.text("inkit_statusTxt", label="● Live   Maya 0 = InkIt 0", height=18, align="left")
+    cmds.text("inkit_statusTxt", label="● Live   Maya 1 = InkIt 1", height=18, align="left")
     cmds.setParent("..")
     try:
         cmds.control("inkit_statusRow", edit=True, visible=True)
@@ -729,6 +911,7 @@ _ensure_active_shelf_button()
 
 if not _inkit_silent_install:
     cmds.showWindow(win)
+    _inkit_install_focus_guard()
 
 if not _inkit_silent_install:
     globals()["inkit_maya_sync_enabled"] = True
